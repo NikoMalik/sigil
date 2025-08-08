@@ -1,4 +1,4 @@
-module github.com/dgraph-io/ristretto/v2
+module github.com/NikoMalik/ristretto/v2
 
 go 1.23.0
 
@@ -14,6 +14,7 @@ require (
 
 require (
 	github.com/davecgh/go-spew v1.1.1 // indirect
+	github.com/goccy/go-reflect v1.2.0 // indirect
 	github.com/pmezard/go-difflib v1.0.0 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )

@@ -7,7 +7,7 @@ package ristretto
 
 import (
 	"fmt"
-	"math/rand"
+	"math/rand/v2"
 	"time"
 )
 
@@ -26,6 +26,13 @@ const (
 	cmDepth = 4
 )
 
+type tm struct {
+}
+
+func (t tm) Uint64() uint64 {
+	return uint64(time.Now().UnixNano())
+}
+
 func newCmSketch(numCounters int64) *cmSketch {
 	if numCounters == 0 {
 		panic("cmSketch: bad numCounters")
@@ -35,7 +42,7 @@ func newCmSketch(numCounters int64) *cmSketch {
 	sketch := &cmSketch{mask: uint64(numCounters - 1)}
 	// Initialize rows of counters and seeds.
 	// Cryptographic precision not needed
-	source := rand.New(rand.NewSource(time.Now().UnixNano())) //nolint:gosec
+	source := rand.New(tm{}) //nolint:gosec
 	for i := 0; i < cmDepth; i++ {
 		sketch.seed[i] = source.Uint64()
 		sketch.rows[i] = newCmRow(numCounters)

@@ -321,12 +321,13 @@ func (s *sortHelper) sortSmall(start, end int) {
 		_, next = s.b.Slice(next)
 	}
 
-	// We are sorting the slices pointed to by s.small offsets, but only moving the offsets around.
+	// We are sorting the slices pointed to by s.small offsets, but only moving the offsets aroun.
 	sort.Slice(s.small, func(i, j int) bool {
 		left, _ := s.b.Slice(s.small[i])
 		right, _ := s.b.Slice(s.small[j])
 		return s.less(left, right)
 	})
+
 	// Now we iterate over the s.small offsets and copy over the slices. The result is now in order.
 	for _, off := range s.small {
 		_, _ = s.tmp.Write(rawSlice(s.b.buf[off:]))

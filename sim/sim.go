@@ -10,7 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"math/rand"
+	"math/rand/v2"
 	"strconv"
 	"strings"
 	"time"
@@ -30,13 +30,19 @@ var (
 // approximate access distributions.
 type Simulator func() (uint64, error)
 
-// NewZipfian creates a Simulator returning numbers following a Zipfian [1]
+type tm struct {
+}
+
+func (t tm) Uint64() uint64 {
+	return uint64(time.Now().UnixNano())
+}
+
+// / NewZipfian creates a Simulator returning numbers following a Zipfian [1]
 // distribution infinitely. Zipfian distributions are useful for simulating real
 // workloads.
-//
 // [1]: https://en.wikipedia.org/wiki/Zipf%27s_law
 func NewZipfian(s, v float64, n uint64) Simulator {
-	z := rand.NewZipf(rand.New(rand.NewSource(time.Now().UnixNano())), s, v, n)
+	z := rand.NewZipf(rand.New(tm{}), s, v, n)
 	return func() (uint64, error) {
 		return z.Uint64(), nil
 	}
@@ -47,10 +53,8 @@ func NewZipfian(s, v float64, n uint64) Simulator {
 //
 // [1]: https://en.wikipedia.org/wiki/Uniform_distribution_(continuous)
 func NewUniform(max uint64) Simulator {
-	m := int64(max)
-	r := rand.New(rand.NewSource(time.Now().UnixNano()))
 	return func() (uint64, error) {
-		return uint64(r.Int63n(m)), nil
+		return rand.Uint64N(max), nil
 	}
 }
 

@@ -8,9 +8,8 @@ package z
 import (
 	"bytes"
 	"fmt"
-	"math"
 	"math/bits"
-	"math/rand"
+	"math/rand/v2"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -40,15 +39,58 @@ var allocRef uint64
 var allocs map[uint64]*Allocator
 var calculatedLog2 []int
 
+var tab64 = [64]uintptr{
+	63, 0, 58, 1, 59, 47, 53, 2,
+	60, 39, 48, 27, 54, 33, 42, 3,
+	61, 51, 37, 40, 49, 18, 28, 20,
+	55, 30, 34, 11, 43, 14, 22, 4,
+	62, 57, 46, 52, 38, 26, 32, 41,
+	50, 36, 17, 19, 29, 10, 13, 21,
+	56, 45, 25, 31, 35, 16, 9, 12,
+	44, 24, 15, 8, 23, 7, 6, 5,
+}
+
+// log2 computes the binary logarithm of x, rounded up to the next integer
+func Log2(i uintptr) (n uintptr) {
+	if i == 0 {
+		return 0
+	}
+
+	i |= i >> 1
+	i |= i >> 2
+	i |= i >> 4
+	i |= i >> 8
+	i |= i >> 16
+	i |= i >> 32
+
+	// Use the lookup table to determine the position of the highest bit.
+	return uintptr(tab64[((i-(i>>1))*0x07EDD5E59A4E28C2)>>58])
+}
+
+func Log2Ceil(i uintptr) (n uintptr) {
+	if i == 0 {
+		return 0
+	}
+	i--
+	i |= i >> 1
+	i |= i >> 2
+	i |= i >> 4
+	i |= i >> 8
+	i |= i >> 16
+	i |= i >> 32
+
+	return uintptr(tab64[((i-(i>>1))*0x07EDD5E59A4E28C2)>>58]) + 1
+}
+
 func init() {
 	allocsMu = new(sync.Mutex)
 	allocs = make(map[uint64]*Allocator)
 
 	// Set up a unique Ref per process.
-	allocRef = uint64(rand.Int63n(1<<16)) << 48
+	allocRef = uint64(rand.Int64N(1<<16)) << 48
 	calculatedLog2 = make([]int, 1025)
 	for i := 1; i <= 1024; i++ {
-		calculatedLog2[i] = int(math.Log2(float64(i)))
+		calculatedLog2[i] = int(Log2(uintptr((i))))
 	}
 }
 

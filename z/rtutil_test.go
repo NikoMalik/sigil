@@ -7,7 +7,8 @@ package z
 
 import (
 	"hash/fnv"
-	"math/rand"
+	rand "math/rand"
+	v2 "math/rand/v2"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -312,6 +313,25 @@ func BenchmarkFastRand(b *testing.B) {
 	})
 }
 
+func BenchmarkRandv2(b *testing.B) {
+	benchmarkRand(b, func() func() uint32 {
+		return v2.Uint32
+	})
+}
+
+type void struct {
+}
+
+func (v void) Uint64() uint64 {
+	return uint64(time.Now().Unix())
+}
+
+type Src int
+
+func (s Src) Uint64() uint64 {
+	return uint64(s)
+}
+
 func BenchmarkRandSource(b *testing.B) {
 	benchmarkRand(b, func() func() uint32 {
 		s := rand.New(rand.NewSource(time.Now().Unix()))
@@ -319,9 +339,22 @@ func BenchmarkRandSource(b *testing.B) {
 	})
 }
 
+func BenchmarkRandSourcev2(b *testing.B) {
+	benchmarkRand(b, func() func() uint32 {
+		s := v2.New(Src(time.Now().UnixNano()))
+		return func() uint32 { return s.Uint32() }
+	})
+}
+
 func BenchmarkRandGlobal(b *testing.B) {
 	benchmarkRand(b, func() func() uint32 {
 		return func() uint32 { return rand.Uint32() }
+	})
+}
+
+func BenchmarkRandGlobalv2(b *testing.B) {
+	benchmarkRand(b, func() func() uint32 {
+		return func() uint32 { return v2.Uint32() }
 	})
 }
 

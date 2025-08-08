@@ -9,11 +9,10 @@ import (
 	"fmt"
 	"math"
 	"os"
-	"reflect"
 	"strings"
 	"unsafe"
 
-	"github.com/dgraph-io/ristretto/v2/z/simd"
+	"github.com/NikoMalik/ristretto/v2/z/simd"
 )
 
 var (
@@ -191,12 +190,10 @@ func BytesToUint64Slice(b []byte) []uint64 {
 	if len(b) == 0 {
 		return nil
 	}
-	var u64s []uint64
-	hdr := (*reflect.SliceHeader)(unsafe.Pointer(&u64s))
-	hdr.Len = len(b) / 8
-	hdr.Cap = hdr.Len
-	hdr.Data = uintptr(unsafe.Pointer(&b[0]))
-	return u64s
+	if len(b)%8 != 0 {
+		panic("BytesToUint64Slice: length of byte slice must be a multiple of 8")
+	}
+	return unsafe.Slice((*uint64)(unsafe.Pointer(unsafe.SliceData(b))), len(b)/8)
 }
 
 func (t *Tree) newNode(bit uint64) node {
