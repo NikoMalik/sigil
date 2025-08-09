@@ -466,13 +466,15 @@ func (c *Cache[K, V]) Reallocate() error {
 	}
 
 	// Lock to prevent concurrent operations
-	// c.mu.Lock()
-	// defer c.mu.Unlock()
+	c.mu.Lock()
+	defer c.mu.Unlock()
 
 	// Stop processing to ensure consistent state
-	c.stop <- struct{}{}
+	select {
+	case c.stop <- struct{}{}:
+	case <-time.After(1 * time.Second):
+	}
 	<-c.done
-
 	// Drain setBuf to process pending operations
 	for len(c.setBuf) > 0 {
 		select {
@@ -483,7 +485,7 @@ func (c *Cache[K, V]) Reallocate() error {
 			}
 			switch i.flag {
 			case itemNew:
-				victims, added := c.cachePolicy.Add(i.Key, i.Cost)
+				victims, added := c.cachePolicy.Add(i.Key, i.OriginalKey, i.Cost)
 				if added {
 					c.storedItems.Set(i)
 					c.Metrics.add(keyAdd, i.Key, 1)
@@ -496,7 +498,7 @@ func (c *Cache[K, V]) Reallocate() error {
 					c.onEvict(victim)
 				}
 			case itemUpdate:
-				c.cachePolicy.Update(i.Key, i.Cost)
+				c.cachePolicy.Update(i.Key, i.OriginalKey, i.Cost)
 			case itemDelete:
 				c.cachePolicy.Del(i.Key)
 				_, val := c.storedItems.Del(i.Key, i.Conflict)
@@ -521,6 +523,7 @@ func (c *Cache[K, V]) Reallocate() error {
 	var copiedCost uint64
 	c.storedItems.Iter(func(key K, value V) bool {
 		keyHash, conflictHash := c.keyToHash(key)
+		// fmt.Printf("Copying key=%v, hash=%d, ", key, keyHash)
 		expiration := c.storedItems.Expiration(keyHash)
 		cost := oldPolicy.Cost(keyHash)
 		if cost <= 0 && c.cost != nil {
@@ -530,7 +533,7 @@ func (c *Cache[K, V]) Reallocate() error {
 			}
 		}
 		if cost <= 0 {
-			cost = 1 // Ensure non-zero cost
+			cost = 1
 		}
 		item := &Item[K, V]{
 			Key:         keyHash,
@@ -541,27 +544,37 @@ func (c *Cache[K, V]) Reallocate() error {
 			Expiration:  expiration,
 		}
 		newStore.Set(item)
-		newPolicy.Add(keyHash, cost)
+		newPolicy.Add(keyHash, key, cost)
 		for i := 0; i < 5; i++ {
 			newPolicy.Push([]uint64{keyHash})
 		}
 		copiedKeys++
 		copiedCost += uint64(cost)
+
 		return false
+
 	})
 
 	// Update metrics
 	if c.Metrics != nil {
-		oldKeys := c.Metrics.KeysAdded()
-		oldCost := c.Metrics.CostAdded()
-		if oldKeys > 0 {
-			c.Metrics.add(keyAdd, 0, -oldKeys)
+		// oldKeys := c.Metrics.KeysAdded()
+		// oldCost := c.Metrics.CostAdded()
+		// if oldKeys > 0 {
+		// 	c.Metrics.add(keyAdd, 0, uint64(-int64(oldKeys)))
+		// }
+		// if oldCost > 0 {
+		// 	c.Metrics.add(costAdd, 0, uint64(-int64(oldCost)))
+		// }
+		// c.Metrics.add(keyAdd, 0, copiedKeys)
+		// c.Metrics.add(costAdd, 0, copiedCost)
+
+		c.Metrics.Clear()
+		if copiedKeys > 0 {
+			c.Metrics.add(keyAdd, 0, copiedKeys)
 		}
-		if oldCost > 0 {
-			c.Metrics.add(costAdd, 0, -oldCost)
+		if copiedCost > 0 {
+			c.Metrics.add(costAdd, 0, copiedCost)
 		}
-		c.Metrics.add(keyAdd, 0, copiedKeys)
-		c.Metrics.add(costAdd, 0, copiedCost)
 	}
 
 	// Reinitialize buffers and ticker
@@ -775,21 +788,24 @@ func (c *Cache[K, V]) processItems() {
 
 			switch i.flag {
 			case itemNew:
-				victims, added := c.cachePolicy.Add(i.Key, i.Cost)
+				victims, added := c.cachePolicy.Add(i.Key, i.OriginalKey, i.Cost)
 				if added {
 					c.storedItems.Set(i)
-					c.Metrics.add(keyAdd, i.Key, 1)
+					c.Metrics.add(keyAdd, i.Key, 1) // Move after Set
 					trackAdmission(i.Key)
+					// fmt.Printf("processItems: Added key=%d, cost=%d\n", i.Key, i.Cost)
 				} else {
 					c.onReject(i)
+					// fmt.Printf("processItems: Rejected key=%d, cost=%d\n", i.Key, i.Cost)
 				}
 				for _, victim := range victims {
 					victim.Conflict, victim.Value = c.storedItems.Del(victim.Key, 0)
 					onEvict(victim)
+					// fmt.Printf("processItems: Evicted key=%d\n", victim.Key)
 				}
 
 			case itemUpdate:
-				c.cachePolicy.Update(i.Key, i.Cost)
+				c.cachePolicy.Update(i.Key, i.OriginalKey, i.Cost)
 
 			case itemDelete:
 				c.cachePolicy.Del(i.Key) // Deals with metrics updates.

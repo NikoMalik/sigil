@@ -88,7 +88,7 @@ func (sm *shardedMap[K, V]) Iter(cb func(k K, v V) (stop bool)) {
 		stopped := func() bool {
 			shard.RLock()
 			defer shard.RUnlock()
-
+			// fmt.Printf("Iterating shard %d, keys=%v\n", i, shard.data)
 			for _, v := range shard.data {
 				if stop := cb(v.originalKey, v.value); stop {
 					return true
@@ -96,13 +96,11 @@ func (sm *shardedMap[K, V]) Iter(cb func(k K, v V) (stop bool)) {
 			}
 			return false
 		}()
-
 		if stopped {
 			break
 		}
 	}
 }
-
 func (sm *shardedMap[K, V]) Get(key, conflict uint64) (V, bool) {
 	return sm.shards[key%numShards].get(key, conflict)
 }
@@ -186,30 +184,25 @@ func (m *lockedMap[K, V]) Expiration(key uint64) time.Time {
 
 func (m *lockedMap[K, V]) Set(i *Item[K, V]) {
 	if i == nil {
-		// If the item is nil make this Set a no-op.
 		return
 	}
-
 	m.Lock()
 	defer m.Unlock()
 	item, ok := m.data[i.Key]
-
+	// fmt.Printf("lockedMap.Set: key=%d, originalKey=%v, exists=%v\n", i.Key, i.OriginalKey, ok)
 	if ok {
-		// The item existed already. We need to check the conflict key and reject the
-		// update if they do not match. Only after that the expiration map is updated.
 		if i.Conflict != 0 && (i.Conflict != item.conflict) {
+			// fmt.Printf("lockedMap.Set: Conflict mismatch for key=%d\n", i.Key)
 			return
 		}
 		if m.shouldUpdate != nil && !m.shouldUpdate(i.Value, item.value) {
+			// fmt.Printf("lockedMap.Set: ShouldUpdate rejected for key=%d\n", i.Key)
 			return
 		}
 		m.em.update(i.Key, i.Conflict, item.expiration, i.Expiration)
 	} else {
-		// The value is not in the map already. There's no need to return anything.
-		// Simply add the expiration map.
 		m.em.add(i.Key, i.Conflict, i.Expiration)
 	}
-
 	m.data[i.Key] = storeItem[K, V]{
 		key:         i.Key,
 		originalKey: i.OriginalKey,

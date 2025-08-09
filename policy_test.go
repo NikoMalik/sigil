@@ -2,7 +2,6 @@
  * SPDX-FileCopyrightText: © Hypermode Inc. <hello@hypermode.com>
  * SPDX-License-Identifier: Apache-2.0
  */
-
 package ristretto
 
 import (
@@ -69,29 +68,29 @@ func TestPolicyAdd(t *testing.T) {
 	t.Parallel()
 
 	p := newDefaultPolicy[int, int](1000, 100)
-	if victims, added := p.Add(1, 101); victims != nil || added {
+	if victims, added := p.Add(1, 1, 101); victims != nil || added {
 		t.Fatal("can't add an item bigger than entire cache")
 	}
 	p.Lock()
-	p.evict.add(1, 1)
+	p.evict.add(1, 1, 1)
 	p.admit.Increment(1)
 	p.admit.Increment(2)
 	p.admit.Increment(3)
 	p.Unlock()
 
-	victims, added := p.Add(1, 1)
+	victims, added := p.Add(1, 1, 1)
 	require.Nil(t, victims)
 	require.False(t, added)
 
-	victims, added = p.Add(2, 20)
+	victims, added = p.Add(2, 2, 20)
 	require.Nil(t, victims)
 	require.True(t, added)
 
-	victims, added = p.Add(3, 90)
+	victims, added = p.Add(3, 3, 90)
 	require.NotNil(t, victims)
 	require.True(t, added)
 
-	victims, added = p.Add(4, 20)
+	victims, added = p.Add(4, 4, 20)
 	require.NotNil(t, victims)
 	require.False(t, added)
 }
@@ -100,7 +99,7 @@ func TestPolicyHas(t *testing.T) {
 	t.Parallel()
 
 	p := newDefaultPolicy[int, int](100, 10)
-	p.Add(1, 1)
+	p.Add(1, 1, 1)
 	require.True(t, p.Has(1))
 	require.False(t, p.Has(2))
 }
@@ -109,7 +108,7 @@ func TestPolicyDel(t *testing.T) {
 	t.Parallel()
 
 	p := newDefaultPolicy[int, int](100, 10)
-	p.Add(1, 1)
+	p.Add(1, 1, 1)
 	p.Del(1)
 	p.Del(2)
 	require.False(t, p.Has(1))
@@ -120,7 +119,7 @@ func TestPolicyCap(t *testing.T) {
 	t.Parallel()
 
 	p := newDefaultPolicy[int, int](100, 10)
-	p.Add(1, 1)
+	p.Add(1, 1, 1)
 	require.Equal(t, int64(9), p.Cap())
 }
 
@@ -128,10 +127,10 @@ func TestPolicyUpdate(t *testing.T) {
 	t.Parallel()
 
 	p := newDefaultPolicy[int, int](100, 10)
-	p.Add(1, 1)
-	p.Update(1, 2)
+	p.Add(1, 1, 1)
+	p.Update(1, 1, 2)
 	p.Lock()
-	require.Equal(t, int64(2), p.evict.keyCosts[1])
+	require.Equal(t, int64(2), p.evict.keyCosts[1].cost)
 	p.Unlock()
 }
 
@@ -139,7 +138,7 @@ func TestPolicyCost(t *testing.T) {
 	t.Parallel()
 
 	p := newDefaultPolicy[int, int](100, 10)
-	p.Add(1, 2)
+	p.Add(1, 1, 2)
 	require.Equal(t, int64(2), p.Cost(1))
 	require.Equal(t, int64(-1), p.Cost(2))
 }
@@ -148,9 +147,9 @@ func TestPolicyClear(t *testing.T) {
 	t.Parallel()
 
 	p := newDefaultPolicy[int, int](100, 10)
-	p.Add(1, 1)
-	p.Add(2, 2)
-	p.Add(3, 3)
+	p.Add(1, 1, 1)
+	p.Add(2, 2, 2)
+	p.Add(3, 3, 3)
 	p.Clear()
 	require.Equal(t, int64(10), p.Cap())
 	require.False(t, p.Has(1))
@@ -166,7 +165,7 @@ func TestPolicyClose(t *testing.T) {
 	}()
 
 	p := newDefaultPolicy[int, int](100, 10)
-	p.Add(1, 1)
+	p.Add(1, 1, 1)
 	p.Close()
 	p.itemsCh <- []uint64{1}
 }
@@ -184,26 +183,29 @@ func TestAddAfterClose(t *testing.T) {
 
 	p := newDefaultPolicy[int, int](100, 10)
 	p.Close()
-	p.Add(1, 1)
+	victims, added := p.Add(1, 1, 1)
+	require.Nil(t, victims)
+	require.False(t, added)
 }
 
 func TestSampledLFUAdd(t *testing.T) {
 	t.Parallel()
 
-	e := newSampledLFU(4)
-	e.add(1, 1)
-	e.add(2, 2)
-	e.add(3, 1)
+	e := newSampledLFU[int, int](4)
+	e.add(1, 1, 1)
+	e.add(2, 2, 2)
+	e.add(3, 3, 1)
 	require.Equal(t, int64(4), e.used)
-	require.Equal(t, int64(2), e.keyCosts[2])
+	require.Equal(t, int64(2), e.keyCosts[2].cost)
+	require.Equal(t, 2, e.keyCosts[2].originalKey)
 }
 
 func TestSampledLFUDel(t *testing.T) {
 	t.Parallel()
 
-	e := newSampledLFU(4)
-	e.add(1, 1)
-	e.add(2, 2)
+	e := newSampledLFU[int, int](4)
+	e.add(1, 1, 1)
+	e.add(2, 2, 2)
 	e.del(2)
 	require.Equal(t, int64(1), e.used)
 	_, ok := e.keyCosts[2]
@@ -214,20 +216,22 @@ func TestSampledLFUDel(t *testing.T) {
 func TestSampledLFUUpdate(t *testing.T) {
 	t.Parallel()
 
-	e := newSampledLFU(4)
-	e.add(1, 1)
-	require.True(t, e.updateIfHas(1, 2))
+	e := newSampledLFU[int, int](4)
+	e.add(1, 1, 1)
+	require.True(t, e.updateIfHas(1, 1, 2))
 	require.Equal(t, int64(2), e.used)
-	require.False(t, e.updateIfHas(2, 2))
+	require.Equal(t, int64(2), e.keyCosts[1].cost)
+	require.Equal(t, 1, e.keyCosts[1].originalKey)
+	require.False(t, e.updateIfHas(2, 2, 2))
 }
 
 func TestSampledLFUClear(t *testing.T) {
 	t.Parallel()
 
-	e := newSampledLFU(4)
-	e.add(1, 1)
-	e.add(2, 2)
-	e.add(3, 1)
+	e := newSampledLFU[int, int](4)
+	e.add(1, 1, 1)
+	e.add(2, 2, 2)
+	e.add(3, 3, 1)
 	e.clear()
 	require.Equal(t, 0, len(e.keyCosts))
 	require.Equal(t, int64(0), e.used)
@@ -236,23 +240,23 @@ func TestSampledLFUClear(t *testing.T) {
 func TestSampledLFURoom(t *testing.T) {
 	t.Parallel()
 
-	e := newSampledLFU(16)
-	e.add(1, 1)
-	e.add(2, 2)
-	e.add(3, 3)
+	e := newSampledLFU[int, int](16)
+	e.add(1, 1, 1)
+	e.add(2, 2, 2)
+	e.add(3, 3, 3)
 	require.Equal(t, int64(6), e.roomLeft(4))
 }
 
 func TestSampledLFUSample(t *testing.T) {
 	t.Parallel()
 
-	e := newSampledLFU(16)
-	e.add(4, 4)
-	e.add(5, 5)
-	sample := e.fillSample([]*policyPair{
-		{1, 1},
-		{2, 2},
-		{3, 3},
+	e := newSampledLFU[int, int](16)
+	e.add(4, 4, 4)
+	e.add(5, 5, 5)
+	sample := e.fillSample([]*policyPair[int]{
+		{key: 1, originalKey: 1, cost: 1},
+		{key: 2, originalKey: 2, cost: 2},
+		{key: 3, originalKey: 3, cost: 3},
 	})
 	k := sample[len(sample)-1].key
 	require.Equal(t, 5, len(sample))
