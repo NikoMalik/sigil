@@ -554,6 +554,9 @@ func (c *Cache[K, V]) Reallocate() error {
 		return false
 
 	})
+	// Clear old store and policy to invoke onEvict and free memory
+	c.storedItems.Clear(c.onEvict)
+	c.cachePolicy.Clear()
 
 	// Update metrics
 	if c.Metrics != nil {
