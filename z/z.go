@@ -8,44 +8,66 @@ package z
 import (
 	"context"
 	"sync"
-	"unsafe"
 
 	"github.com/cespare/xxhash/v2"
-	goreflect "github.com/goccy/go-reflect"
 )
 
 type Key interface {
 	uint64 | string | []byte | byte | int | int32 | uint32 | int64
 }
 
+// func KeyToHash[K Key](key K) (uint64, uint64) {
+// 	t := goreflect.ValueNoEscapeOf(key)
+// 	switch t.Kind() {
+// 	case goreflect.Uint64:
+// 		return *(*uint64)(unsafe.Pointer(&key)), 0
+// 	case goreflect.String:
+// 		s := *(*string)(unsafe.Pointer(&key))
+// 		return MemHashString(s), xxhash.Sum64String(s)
+// 	case goreflect.Slice:
+// 		val := goreflect.ValueOf(key)
+// 		if val.Type().Elem().Kind() == goreflect.Uint8 {
+// 			b := val.Bytes()
+// 			if len(b)%8 == 0 && len(b) > 0 {
+// 				u64s := BytesToUint64Slice(b)
+// 				return u64s[0], xxhash.Sum64(b) // Use first uint64 as primary hash
+// 			}
+// 			return MemHash(b), xxhash.Sum64(b) // Fallback for non-8-byte multiples
+// 		}
+// 	case goreflect.Uint8:
+// 		return uint64(*(*byte)(unsafe.Pointer(&key))), 0
+// 	case goreflect.Int, goreflect.Int32, goreflect.Int64:
+// 		return uint64(goreflect.ValueNoEscapeOf(key).Int()), 0
+// 	case goreflect.Uint32:
+// 		return uint64(goreflect.ValueNoEscapeOf(key).Uint()), 0
+// 	default:
+// 		panic("unsupported type")
+// 	}
+// 	panic("unsupported")
+// }
+
 func KeyToHash[K Key](key K) (uint64, uint64) {
-	t := goreflect.ValueNoEscapeOf(key)
-	switch t.Kind() {
-	case goreflect.Uint64:
-		return *(*uint64)(unsafe.Pointer(&key)), 0
-	case goreflect.String:
-		s := *(*string)(unsafe.Pointer(&key))
-		return MemHashString(s), xxhash.Sum64String(s)
-	case goreflect.Slice:
-		val := goreflect.ValueOf(key)
-		if val.Type().Elem().Kind() == goreflect.Uint8 {
-			b := val.Bytes()
-			if len(b)%8 == 0 && len(b) > 0 {
-				u64s := BytesToUint64Slice(b)
-				return u64s[0], xxhash.Sum64(b) // Use first uint64 as primary hash
-			}
-			return MemHash(b), xxhash.Sum64(b) // Fallback for non-8-byte multiples
-		}
-	case goreflect.Uint8:
-		return uint64(*(*byte)(unsafe.Pointer(&key))), 0
-	case goreflect.Int, goreflect.Int32, goreflect.Int64:
-		return uint64(goreflect.ValueNoEscapeOf(key).Int()), 0
-	case goreflect.Uint32:
-		return uint64(goreflect.ValueNoEscapeOf(key).Uint()), 0
+	keyAsAny := any(key)
+	switch k := keyAsAny.(type) {
+	case uint64:
+		return k, 0
+	case string:
+		return MemHashString(k), xxhash.Sum64String(k)
+	case []byte:
+		return MemHash(k), xxhash.Sum64(k)
+	case byte:
+		return uint64(k), 0
+	case int:
+		return uint64(k), 0
+	case int32:
+		return uint64(k), 0
+	case uint32:
+		return uint64(k), 0
+	case int64:
+		return uint64(k), 0
 	default:
-		panic("unsupported type")
+		panic("Key type not supported")
 	}
-	panic("unsupported")
 }
 
 var (

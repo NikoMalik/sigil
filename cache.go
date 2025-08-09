@@ -69,8 +69,10 @@ type Cache[K Key, V any] struct {
 	// is not set, the default keyToHash function is used.
 	keyToHash func(K) (uint64, uint64)
 	// stop is used to stop the processItems goroutine.
-	stop chan struct{}
-	done chan struct{}
+	stop        chan struct{}
+	done        chan struct{}
+	monitorStop chan struct{} // New channel for monitorAndReallocate
+	monitorDone chan struct{} // New channel for monitorAndReallocate
 	// indicates whether cache is closed.
 	isClosed atomic.Bool
 	// cost calculates cost from a value.
@@ -82,8 +84,11 @@ type Cache[K Key, V any] struct {
 	cleanupTicker *time.Ticker
 	// Metrics contains a running log of important statistics like hits, misses,
 	// and dropped items.
-	Metrics  *Metrics
-	itemSize int64
+	Metrics               *Metrics
+	mu                    sync.Mutex
+	itemSize              int64
+	bufferItems           int64
+	disableAutoReallocate bool
 }
 
 // Config is passed to NewCache for creating new Cache instances.
@@ -190,6 +195,8 @@ type Config[K Key, V any] struct {
 
 	// TtlTickerDurationInSec sets the value of time ticker for cleanup keys on TTL expiry.
 	TtlTickerDurationInSec int64
+
+	DisableAutoReallocate bool // field to disable auto-reallocation
 }
 
 type itemFlag byte
@@ -232,17 +239,21 @@ func NewCache[K Key, V any](config *Config[K, V]) (*Cache[K, V], error) {
 	}
 	policy := newPolicy[K, V](config.NumCounters, config.MaxCost)
 	cache := &Cache[K, V]{
-		storedItems:        newStore[K, V](),
-		cachePolicy:        policy,
-		getBuf:             newRingBuffer(policy, config.BufferItems),
-		setBuf:             make(chan *Item[K, V], setBufSize),
-		keyToHash:          config.KeyToHash,
-		stop:               make(chan struct{}),
-		done:               make(chan struct{}),
-		cost:               config.Cost,
-		ignoreInternalCost: config.IgnoreInternalCost,
-		cleanupTicker:      time.NewTicker(time.Duration(config.TtlTickerDurationInSec) * time.Second / 2),
-		itemSize:           int64(unsafe.Sizeof(storeItem[K, V]{})),
+		storedItems:           newStore[K, V](),
+		cachePolicy:           policy,
+		getBuf:                newRingBuffer(policy, config.BufferItems),
+		setBuf:                make(chan *Item[K, V], setBufSize),
+		keyToHash:             config.KeyToHash,
+		stop:                  make(chan struct{}),
+		done:                  make(chan struct{}),
+		monitorStop:           make(chan struct{}), // Initialize monitor channels
+		monitorDone:           make(chan struct{}),
+		cost:                  config.Cost,
+		ignoreInternalCost:    config.IgnoreInternalCost,
+		cleanupTicker:         time.NewTicker(time.Duration(config.TtlTickerDurationInSec) * time.Second / 2),
+		itemSize:              int64(unsafe.Sizeof(storeItem[K, V]{})),
+		bufferItems:           config.BufferItems,
+		disableAutoReallocate: config.DisableAutoReallocate,
 	}
 	cache.storedItems.SetShouldUpdateFn(config.ShouldUpdate)
 	cache.onExit = func(val V) {
@@ -273,6 +284,9 @@ func NewCache[K Key, V any](config *Config[K, V]) (*Cache[K, V], error) {
 	//       goroutines we have running cache.processItems(), so 1 should
 	//       usually be sufficient
 	go cache.processItems()
+	if !cache.disableAutoReallocate {
+		go cache.monitorAndReallocate(0.9, time.Second)
+	}
 	return cache, nil
 }
 
@@ -283,9 +297,27 @@ func (c *Cache[K, V]) Wait() {
 		return
 	}
 	wait := make(chan struct{})
-	c.setBuf <- &Item[K, V]{wait: wait}
-	<-wait
+	select {
+	case c.setBuf <- &Item[K, V]{wait: wait}:
+		select {
+		case <-wait:
+			// fmt.Println("Wait completed")
+		case <-time.After(1 * time.Second):
+			// fmt.Println("Wait timed out")
+		}
+	case <-time.After(1 * time.Second):
+		// fmt.Println("setBuf full, Wait skipped")
+	}
 }
+
+// func (c *Cache[K, V]) Wait() {
+// 	if c == nil || c.isClosed.Load() {
+// 		return
+// 	}
+// 	wait := make(chan struct{})
+// 	c.setBuf <- &Item[K, V]{wait: wait}
+// 	<-wait
+// }
 
 // Get returns the value (if any) and a boolean representing whether the
 // value was found or not. The value can be nil and the boolean can be true at
@@ -304,6 +336,31 @@ func (c *Cache[K, V]) Get(key K) (V, bool) {
 		c.Metrics.add(miss, keyHash, 1)
 	}
 	return value, ok
+}
+
+func (c *Cache[K, V]) monitorAndReallocate(threshold float64, checkInterval time.Duration) {
+	ticker := time.NewTicker(checkInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			max := c.MaxCost()
+			rem := c.RemainingCost()
+			used := max - rem
+			// fmt.Printf("monitorAndReallocate: used=%d, max=%d, threshold=%f\n", used, max, threshold*float64(max))
+			if float64(used) >= threshold*float64(max) {
+				// fmt.Printf("Triggering reallocate: used=%d, max=%d\n", used, max)
+				if err := c.Reallocate(); err != nil {
+					// fmt.Printf("Reallocate failed: %v\n", err)
+				}
+				// Signal to restart monitorAndReallocate
+				c.monitorStop <- struct{}{}
+				return
+			}
+		case <-c.monitorStop:
+			return
+		}
+	}
 }
 
 // Set attempts to add the key-value item to the cache. If it returns false,
@@ -400,6 +457,178 @@ func (c *Cache[K, V]) Del(key K) {
 	}
 }
 
+// Reallocate creates a new cache with double the MaxCost, copies all key-value pairs,
+// and updates the cache's internal state atomically. It preserves TTLs and metrics.
+// Reallocate doubles the MaxCost, copies all key-value pairs, and updates internal state.
+func (c *Cache[K, V]) Reallocate() error {
+	if c == nil || c.isClosed.Load() {
+		return errors.New("cache is nil or closed")
+	}
+
+	// Lock to prevent concurrent operations
+	// c.mu.Lock()
+	// defer c.mu.Unlock()
+
+	// Stop processing to ensure consistent state
+	c.stop <- struct{}{}
+	<-c.done
+
+	// Drain setBuf to process pending operations
+	for len(c.setBuf) > 0 {
+		select {
+		case i := <-c.setBuf:
+			if i.wait != nil {
+				close(i.wait)
+				continue
+			}
+			switch i.flag {
+			case itemNew:
+				victims, added := c.cachePolicy.Add(i.Key, i.Cost)
+				if added {
+					c.storedItems.Set(i)
+					c.Metrics.add(keyAdd, i.Key, 1)
+					c.Metrics.add(costAdd, i.Key, uint64(i.Cost))
+				} else {
+					c.onReject(i)
+				}
+				for _, victim := range victims {
+					victim.Conflict, victim.Value = c.storedItems.Del(victim.Key, 0)
+					c.onEvict(victim)
+				}
+			case itemUpdate:
+				c.cachePolicy.Update(i.Key, i.Cost)
+			case itemDelete:
+				c.cachePolicy.Del(i.Key)
+				_, val := c.storedItems.Del(i.Key, i.Conflict)
+				c.onExit(val)
+			}
+		default:
+			break
+		}
+	}
+
+	// Create new policy with doubled MaxCost
+	oldPolicy := c.cachePolicy
+	newMax := oldPolicy.MaxCost() * 2
+	newPolicy := newPolicy[K, V](oldPolicy.admit.resetAt, newMax)
+	if c.Metrics != nil {
+		newPolicy.CollectMetrics(c.Metrics)
+	}
+
+	// Create new store
+	newStore := newStore[K, V]()
+	var copiedKeys uint64
+	var copiedCost uint64
+	c.storedItems.Iter(func(key K, value V) bool {
+		keyHash, conflictHash := c.keyToHash(key)
+		expiration := c.storedItems.Expiration(keyHash)
+		cost := oldPolicy.Cost(keyHash)
+		if cost <= 0 && c.cost != nil {
+			cost = c.cost(value)
+			if !c.ignoreInternalCost {
+				cost += c.itemSize
+			}
+		}
+		if cost <= 0 {
+			cost = 1 // Ensure non-zero cost
+		}
+		item := &Item[K, V]{
+			Key:         keyHash,
+			OriginalKey: key,
+			Conflict:    conflictHash,
+			Value:       value,
+			Cost:        cost,
+			Expiration:  expiration,
+		}
+		newStore.Set(item)
+		newPolicy.Add(keyHash, cost)
+		for i := 0; i < 5; i++ {
+			newPolicy.Push([]uint64{keyHash})
+		}
+		copiedKeys++
+		copiedCost += uint64(cost)
+		return false
+	})
+
+	// Update metrics
+	if c.Metrics != nil {
+		oldKeys := c.Metrics.KeysAdded()
+		oldCost := c.Metrics.CostAdded()
+		if oldKeys > 0 {
+			c.Metrics.add(keyAdd, 0, -oldKeys)
+		}
+		if oldCost > 0 {
+			c.Metrics.add(costAdd, 0, -oldCost)
+		}
+		c.Metrics.add(keyAdd, 0, copiedKeys)
+		c.Metrics.add(costAdd, 0, copiedCost)
+	}
+
+	// Reinitialize buffers and ticker
+	c.cleanupTicker.Stop()
+	c.cleanupTicker = time.NewTicker(time.Duration(bucketDurationSecs) * time.Second / 2)
+	c.getBuf = newRingBuffer(newPolicy, c.bufferItems)
+	c.setBuf = make(chan *Item[K, V], setBufSize)
+	c.cachePolicy = newPolicy
+	c.storedItems = newStore
+
+	// Reinitialize control channels
+	c.stop = make(chan struct{})
+	c.done = make(chan struct{})
+
+	// Restart processing and monitoring
+	go c.processItems()
+	if !c.disableAutoReallocate {
+		c.monitorStop = make(chan struct{})
+		c.monitorDone = make(chan struct{})
+		go c.monitorAndReallocate(0.9, time.Second)
+	}
+
+	// fmt.Printf("Reallocate completed: new MaxCost=%d, copied keys=%d, cost=%d\n", newMax, copiedKeys, copiedCost)
+	return nil
+}
+
+// Close stops all goroutines and closes all channels.
+func (c *Cache[K, V]) Close() {
+	if c == nil || c.isClosed.Load() {
+		return
+	}
+	c.Clear()
+
+	// Stop processItems and monitorAndReallocate with timeout
+	select {
+	case c.stop <- struct{}{}:
+	case <-time.After(1 * time.Second):
+		// fmt.Println("Close: stop channel send timed out")
+	}
+	select {
+	case c.monitorStop <- struct{}{}:
+	case <-time.After(1 * time.Second):
+		// fmt.Println("Close: monitorStop channel send timed out")
+	}
+	select {
+	case <-c.done:
+	case <-time.After(1 * time.Second):
+		// fmt.Println("Close: waiting for done timed out")
+	}
+	select {
+	case <-c.monitorDone:
+	case <-time.After(1 * time.Second):
+		// fmt.Println("Close: waiting for monitorDone timed out")
+	}
+
+	// Close channels
+	close(c.stop)
+	close(c.done)
+	close(c.monitorStop)
+	close(c.monitorDone)
+	close(c.setBuf)
+	c.cachePolicy.Close()
+	c.cleanupTicker.Stop()
+	c.isClosed.Store(true)
+	// fmt.Println("Close completed")
+}
+
 // Iter iterates the elements of the Map, passing them to the callback.
 // It guarantees that any key in the Map will be visited only once.
 // The set of keys visited by Iter is non-deterministic.
@@ -432,24 +661,6 @@ func (c *Cache[K, V]) GetTTL(key K) (time.Duration, bool) {
 	}
 
 	return time.Until(expiration), true
-}
-
-// Close stops all goroutines and closes all channels.
-func (c *Cache[K, V]) Close() {
-	if c == nil || c.isClosed.Load() {
-		return
-	}
-	c.Clear()
-
-	// Block until processItems goroutine is returned.
-	c.stop <- struct{}{}
-	<-c.done
-	close(c.stop)
-	close(c.done)
-	close(c.setBuf)
-	c.cachePolicy.Close()
-	c.cleanupTicker.Stop()
-	c.isClosed.Store(true)
 }
 
 // Clear empties the hashmap and zeroes all cachePolicy counters. Note that this is

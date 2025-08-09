@@ -46,8 +46,465 @@ func TestCacheKeyToHash(t *testing.T) {
 	require.Equal(t, 3, keyToHashCount)
 }
 
-func TestCacheMaxCost(t *testing.T) {
+func TestCache_AutoReallocate(t *testing.T) {
+	cache, err := NewCache(&Config[int, int]{
+		NumCounters:        1000,
+		MaxCost:            5,
+		BufferItems:        64,
+		IgnoreInternalCost: true,
+		Metrics:            true,
+	})
+	require.NoError(t, err)
+	defer cache.Close()
+
+	for i := 0; i < 5; i++ {
+		ok := cache.Set(i, i, 1)
+		require.True(t, ok, "Set(%d) should succeed", i)
+	}
+	cache.Wait()
+
+	t.Logf("Before reallocate: MaxCost=%d, UsedCost=%d, KeysAdded=%d",
+		cache.MaxCost(), cache.MaxCost()-cache.RemainingCost(), cache.Metrics.KeysAdded())
+	require.Equal(t, int64(5), cache.MaxCost(), "before auto-reallocate")
+
+	require.Eventually(t, func() bool {
+		maxCost := cache.MaxCost()
+		t.Logf("Checking MaxCost=%d, UsedCost=%d, KeysAdded=%d",
+			maxCost, cache.MaxCost()-cache.RemainingCost(), cache.Metrics.KeysAdded())
+		return maxCost == 10
+	}, 10*time.Second, 100*time.Millisecond, "expected MaxCost to auto-double to 10")
+
+	for i := 0; i < 5; i++ {
+		v, ok := cache.Get(i)
+		require.True(t, ok, "key %d must survive reallocation", i)
+		require.Equal(t, i, v)
+	}
+
+	ok := cache.Set(42, 42, 1)
+	require.True(t, ok, "Set(42) after auto-reallocate should succeed")
+	cache.Wait()
+
+	v, ok := cache.Get(42)
+	require.True(t, ok, "new key must be in cache")
+	require.Equal(t, 42, v)
+
+	t.Logf("Final state: MaxCost=%d, UsedCost=%d, KeysAdded=%d",
+		cache.MaxCost(), cache.MaxCost()-cache.RemainingCost(), cache.Metrics.KeysAdded())
+}
+
+func TestReallocateConcurrency(t *testing.T) {
+	cache, err := NewCache(&Config[int, int]{
+		NumCounters: 1000,
+		MaxCost:     100,
+		BufferItems: 64,
+	})
+	require.NoError(t, err)
+	defer cache.Close()
+
+	var wg sync.WaitGroup
+	for i := 0; i < 100; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			cache.Set(i, i, 1)
+			if i == 50 {
+				require.NoError(t, cache.Reallocate())
+			}
+		}(i)
+	}
+	wg.Wait()
+
+	for i := 0; i < 100; i++ {
+		val, ok := cache.Get(i)
+		if ok {
+			require.Equal(t, i, val)
+		}
+	}
+	require.Equal(t, int64(200), cache.MaxCost())
+}
+
+func TestReallocateMultipleTimes(t *testing.T) {
 	t.Parallel()
+
+	c, err := NewCache(&Config[int, int]{
+		NumCounters:           1000,
+		MaxCost:               10,
+		BufferItems:           64,
+		IgnoreInternalCost:    true,
+		Metrics:               true,
+		DisableAutoReallocate: true, // Disable auto-reallocation to test manual calls
+	})
+	require.NoError(t, err)
+	defer c.Close()
+
+	// Set initial items
+	for i := 0; i < 5; i++ {
+		require.True(t, c.Set(i, i, 1), "Set(%d) should succeed", i)
+	}
+	c.Wait()
+
+	// Initial state
+	require.Equal(t, int64(10), c.MaxCost(), "initial MaxCost")
+	require.Equal(t, uint64(5), c.Metrics.KeysAdded(), "initial KeysAdded")
+	t.Logf("Initial: MaxCost=%d, UsedCost=%d, KeysAdded=%d",
+		c.MaxCost(), c.MaxCost()-c.RemainingCost(), c.Metrics.KeysAdded())
+
+	// Call Reallocate three times
+	for i := 1; i <= 3; i++ {
+		require.NoError(t, c.Reallocate(), "Reallocate #%d should succeed", i)
+		expectedMaxCost := int64(10 * (1 << uint(i))) // 20, 40, 80
+		require.Equal(t, expectedMaxCost, c.MaxCost(), "MaxCost after Reallocate #%d", i)
+		require.Equal(t, uint64(5), c.Metrics.KeysAdded(), "KeysAdded after Reallocate #%d", i)
+		t.Logf("After Reallocate #%d: MaxCost=%d, UsedCost=%d, KeysAdded=%d",
+			i, c.MaxCost(), c.MaxCost()-c.RemainingCost(), c.Metrics.KeysAdded())
+
+		// Verify all items are preserved
+		for j := 0; j < 5; j++ {
+			val, ok := c.Get(j)
+			require.True(t, ok, "key %d must survive Reallocate #%d", j, i)
+			require.Equal(t, j, val, "value for key %d after Reallocate #%d", j, i)
+		}
+	}
+
+	// Add a new item after final reallocation
+	require.True(t, c.Set(42, 42, 1), "Set(42) should succeed after reallocations")
+	c.Wait()
+	val, ok := c.Get(42)
+	require.True(t, ok, "new key must be in cache")
+	require.Equal(t, 42, val, "value for key 42")
+	require.Equal(t, uint64(6), c.Metrics.KeysAdded(), "final KeysAdded")
+}
+
+// TestReallocateWithEvictions tests Reallocate when items are evicted due to policy constraints.
+func TestReallocateWithEvictions(t *testing.T) {
+	t.Parallel()
+
+	evictedKeys := make(map[int]struct{})
+	var mu sync.Mutex
+	c, err := NewCache(&Config[int, int]{
+		NumCounters:           10, // Low NumCounters to force evictions
+		MaxCost:               5,
+		BufferItems:           64,
+		IgnoreInternalCost:    true,
+		Metrics:               true,
+		DisableAutoReallocate: true,
+		OnEvict: func(item *Item[int, int]) {
+			mu.Lock()
+			evictedKeys[item.OriginalKey] = struct{}{}
+			mu.Unlock()
+		},
+	})
+	require.NoError(t, err)
+	defer c.Close()
+
+	// Add items to exceed MaxCost
+	for i := 0; i < 10; i++ {
+		require.True(t, c.Set(i, i, 2), "Set(%d) should succeed", i)
+	}
+	c.Wait()
+
+	// Expect some evictions due to low NumCounters and MaxCost=5
+	mu.Lock()
+	require.NotEmpty(t, evictedKeys, "some keys should be evicted")
+	t.Logf("Evicted keys: %v", evictedKeys)
+	mu.Unlock()
+
+	// Call Reallocate
+	require.NoError(t, c.Reallocate(), "Reallocate should succeed")
+	require.Equal(t, int64(10), c.MaxCost(), "MaxCost after Reallocate")
+	t.Logf("After Reallocate: MaxCost=%d, UsedCost=%d, KeysAdded=%d",
+		c.MaxCost(), c.MaxCost()-c.RemainingCost(), c.Metrics.KeysAdded())
+
+	// Verify surviving items
+	survivingKeys := 0
+	for i := 0; i < 10; i++ {
+		if _, exists := evictedKeys[i]; !exists {
+			val, ok := c.Get(i)
+			require.True(t, ok, "key %d should survive Reallocate if not evicted", i)
+			require.Equal(t, i, val, "value for key %d", i)
+			survivingKeys++
+		}
+	}
+	require.Equal(t, uint64(survivingKeys), c.Metrics.KeysAdded(), "KeysAdded should match surviving keys")
+
+	// Add new items to verify increased capacity
+	require.True(t, c.Set(42, 42, 2), "Set(42) should succeed after Reallocate")
+	c.Wait()
+	val, ok := c.Get(42)
+	require.True(t, ok, "new key must be in cache")
+	require.Equal(t, 42, val, "value for key 42")
+}
+
+// TestReallocateConcurrentSetGet tests concurrent Reallocate, Set, and Get operations.
+func TestReallocateConcurrentSetGet(t *testing.T) {
+	t.Parallel()
+
+	c, err := NewCache(&Config[int, int]{
+		NumCounters:           1000,
+		MaxCost:               100,
+		BufferItems:           64,
+		IgnoreInternalCost:    true,
+		Metrics:               true,
+		DisableAutoReallocate: true,
+	})
+	require.NoError(t, err)
+	defer c.Close()
+
+	var wg sync.WaitGroup
+	const numGoroutines = 10
+	const numOps = 100
+
+	// Concurrent Set operations
+	for i := 0; i < numGoroutines; i++ {
+		wg.Add(1)
+		go func(startKey int) {
+			defer wg.Done()
+			for j := 0; j < numOps; j++ {
+				key := startKey + j
+				c.Set(key, key, 1)
+				time.Sleep(time.Microsecond)
+			}
+		}(i * numOps)
+	}
+
+	// Concurrent Get operations
+	for i := 0; i < numGoroutines; i++ {
+		wg.Add(1)
+		go func(startKey int) {
+			defer wg.Done()
+			for j := 0; j < numOps; j++ {
+				key := startKey + j
+				c.Get(key)
+				time.Sleep(time.Microsecond)
+			}
+		}(i * numOps)
+	}
+
+	// Concurrent Reallocate calls
+	for i := 0; i < 3; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			time.Sleep(time.Duration(i*10) * time.Millisecond) // Stagger calls
+			require.NoError(t, c.Reallocate(), "Reallocate #%d should succeed", i)
+			t.Logf("Reallocate #%d completed: MaxCost=%d", i, c.MaxCost())
+		}(i)
+	}
+
+	wg.Wait()
+
+	// Verify final MaxCost (100 * 2^3 = 800)
+	require.Equal(t, int64(800), c.MaxCost(), "MaxCost after multiple Reallocates")
+
+	// Verify some items are still accessible
+	keysFound := 0
+	for i := 0; i < numGoroutines*numOps; i++ {
+		if val, ok := c.Get(i); ok {
+			require.Equal(t, i, val, "value for key %d", i)
+			keysFound++
+		}
+	}
+	t.Logf("Keys found after concurrent operations: %d", keysFound)
+	require.True(t, keysFound > 0, "some keys should remain in cache")
+}
+
+// TestReallocateWithTTL tests that TTLs are preserved during Reallocate.
+func TestReallocateWithTTL(t *testing.T) {
+	t.Parallel()
+
+	c, err := NewCache(&Config[int, int]{
+		NumCounters:           1000,
+		MaxCost:               10,
+		BufferItems:           64,
+		IgnoreInternalCost:    true,
+		Metrics:               true,
+		DisableAutoReallocate: true,
+	})
+	require.NoError(t, err)
+	defer c.Close()
+
+	// Set items with TTL
+	ttl := 5 * time.Second
+	for i := 0; i < 5; i++ {
+		require.True(t, c.SetWithTTL(i, i, 1, ttl), "SetWithTTL(%d) should succeed", i)
+	}
+	c.Wait()
+
+	// Verify TTLs before Reallocate
+	for i := 0; i < 5; i++ {
+		ttlVal, ok := c.GetTTL(i)
+		require.True(t, ok, "GetTTL(%d) should succeed", i)
+		require.WithinDuration(t, time.Now().Add(ttl), time.Now().Add(ttlVal), 1*time.Second, "TTL for key %d", i)
+	}
+
+	// Call Reallocate
+	require.NoError(t, c.Reallocate(), "Reallocate should succeed")
+	require.Equal(t, int64(20), c.MaxCost(), "MaxCost after Reallocate")
+
+	// Verify TTLs and items after Reallocate
+	for i := 0; i < 5; i++ {
+		val, ok := c.Get(i)
+		require.True(t, ok, "key %d must survive Reallocate", i)
+		require.Equal(t, i, val, "value for key %d", i)
+		ttlVal, ok := c.GetTTL(i)
+		require.True(t, ok, "GetTTL(%d) should succeed after Reallocate", i)
+		require.WithinDuration(t, time.Now().Add(ttl), time.Now().Add(ttlVal), 1*time.Second, "TTL for key %d after Reallocate", i)
+	}
+
+	// Wait for TTL expiration
+	time.Sleep(6 * time.Second)
+
+	// Verify items are expired
+	for i := 0; i < 5; i++ {
+		_, ok := c.Get(i)
+		require.False(t, ok, "key %d should be expired", i)
+		ttlVal, ok := c.GetTTL(i)
+		require.False(t, ok, "GetTTL(%d) should fail after expiration", i)
+		require.Equal(t, time.Duration(0), ttlVal, "TTL for key %d should be zero", i)
+	}
+}
+
+// TestReallocateMetrics tests that metrics are correctly updated after Reallocate.
+func TestReallocateMetrics(t *testing.T) {
+	t.Parallel()
+
+	c, err := NewCache(&Config[int, int]{
+		NumCounters:           1000,
+		MaxCost:               10,
+		BufferItems:           64,
+		IgnoreInternalCost:    true,
+		Metrics:               true,
+		DisableAutoReallocate: true,
+	})
+	require.NoError(t, err)
+	defer c.Close()
+
+	// Add items
+	for i := 0; i < 5; i++ {
+		require.True(t, c.Set(i, i, 2), "Set(%d) should succeed", i)
+	}
+	c.Wait()
+
+	// Verify initial metrics
+	require.Equal(t, uint64(5), c.Metrics.KeysAdded(), "initial KeysAdded")
+	require.Equal(t, uint64(10), c.Metrics.CostAdded(), "initial CostAdded")
+	require.Equal(t, int64(0), c.MaxCost()-c.RemainingCost(), "initial UsedCost")
+	t.Logf("Initial: MaxCost=%d, UsedCost=%d, KeysAdded=%d, CostAdded=%d",
+		c.MaxCost(), c.MaxCost()-c.RemainingCost(), c.Metrics.KeysAdded(), c.Metrics.CostAdded())
+
+	// Call Reallocate
+	require.NoError(t, c.Reallocate(), "Reallocate should succeed")
+	require.Equal(t, int64(20), c.MaxCost(), "MaxCost after Reallocate")
+
+	// Verify metrics after Reallocate
+	require.Equal(t, uint64(5), c.Metrics.KeysAdded(), "KeysAdded after Reallocate")
+	require.Equal(t, uint64(10), c.Metrics.CostAdded(), "CostAdded after Reallocate")
+	require.Equal(t, int64(10), c.MaxCost()-c.RemainingCost(), "UsedCost after Reallocate")
+	t.Logf("After Reallocate: MaxCost=%d, UsedCost=%d, KeysAdded=%d, CostAdded=%d",
+		c.MaxCost(), c.MaxCost()-c.RemainingCost(), c.Metrics.KeysAdded(), c.Metrics.CostAdded())
+
+	// Add more items
+	for i := 5; i < 7; i++ {
+		require.True(t, c.Set(i, i, 2), "Set(%d) should succeed", i)
+	}
+	c.Wait()
+
+	// Verify final metrics
+	require.Equal(t, uint64(7), c.Metrics.KeysAdded(), "final KeysAdded")
+	require.Equal(t, uint64(14), c.Metrics.CostAdded(), "final CostAdded")
+	require.Equal(t, int64(14), c.MaxCost()-c.RemainingCost(), "final UsedCost")
+}
+
+// TestReallocateAfterUpdateMaxCost tests interaction between Reallocate and UpdateMaxCost.
+func TestReallocateAfterUpdateMaxCost(t *testing.T) {
+	t.Parallel()
+
+	c, err := NewCache(&Config[int, int]{
+		NumCounters:           1000,
+		MaxCost:               10,
+		BufferItems:           64,
+		IgnoreInternalCost:    true,
+		Metrics:               true,
+		DisableAutoReallocate: true,
+	})
+	require.NoError(t, err)
+	defer c.Close()
+
+	// Set initial items
+	for i := 0; i < 5; i++ {
+		require.True(t, c.Set(i, i, 1), "Set(%d) should succeed", i)
+	}
+	c.Wait()
+
+	// Update MaxCost
+	c.UpdateMaxCost(50)
+	require.Equal(t, int64(50), c.MaxCost(), "MaxCost after UpdateMaxCost")
+	require.Equal(t, uint64(5), c.Metrics.KeysAdded(), "KeysAdded after UpdateMaxCost")
+	t.Logf("After UpdateMaxCost: MaxCost=%d, UsedCost=%d, KeysAdded=%d",
+		c.MaxCost(), c.MaxCost()-c.RemainingCost(), c.Metrics.KeysAdded())
+
+	// Call Reallocate
+	require.NoError(t, c.Reallocate(), "Reallocate should succeed")
+	require.Equal(t, int64(100), c.MaxCost(), "MaxCost after Reallocate") // 50 * 2
+	require.Equal(t, uint64(5), c.Metrics.KeysAdded(), "KeysAdded after Reallocate")
+	t.Logf("After Reallocate: MaxCost=%d, UsedCost=%d, KeysAdded=%d",
+		c.MaxCost(), c.MaxCost()-c.RemainingCost(), c.Metrics.KeysAdded())
+
+	// Verify all items are preserved
+	for i := 0; i < 5; i++ {
+		val, ok := c.Get(i)
+		require.True(t, ok, "key %d must survive Reallocate", i)
+		require.Equal(t, i, val, "value for key %d", i)
+	}
+
+	// Add new item
+	require.True(t, c.Set(42, 42, 1), "Set(42) should succeed")
+	c.Wait()
+	val, ok := c.Get(42)
+	require.True(t, ok, "new key must be in cache")
+	require.Equal(t, 42, val, "value for key 42")
+}
+
+// TestReallocateEmptyCache tests Reallocate on an empty cache.
+func TestReallocateEmptyCache(t *testing.T) {
+	t.Parallel()
+
+	c, err := NewCache(&Config[int, int]{
+		NumCounters:           1000,
+		MaxCost:               10,
+		BufferItems:           64,
+		IgnoreInternalCost:    true,
+		Metrics:               true,
+		DisableAutoReallocate: true,
+	})
+	require.NoError(t, err)
+	defer c.Close()
+
+	// Initial state: empty cache
+	require.Equal(t, int64(10), c.MaxCost(), "initial MaxCost")
+	require.Equal(t, uint64(0), c.Metrics.KeysAdded(), "initial KeysAdded")
+	require.Equal(t, int64(10), c.RemainingCost(), "initial RemainingCost")
+	t.Logf("Initial: MaxCost=%d, UsedCost=%d, KeysAdded=%d",
+		c.MaxCost(), c.MaxCost()-c.RemainingCost(), c.Metrics.KeysAdded())
+
+	// Call Reallocate
+	require.NoError(t, c.Reallocate(), "Reallocate should succeed on empty cache")
+	require.Equal(t, int64(20), c.MaxCost(), "MaxCost after Reallocate")
+	require.Equal(t, uint64(0), c.Metrics.KeysAdded(), "KeysAdded after Reallocate")
+	require.Equal(t, int64(20), c.RemainingCost(), "RemainingCost after Reallocate")
+	t.Logf("After Reallocate: MaxCost=%d, UsedCost=%d, KeysAdded=%d",
+		c.MaxCost(), c.MaxCost()-c.RemainingCost(), c.Metrics.KeysAdded())
+
+	// Add an item to verify functionality
+	require.True(t, c.Set(1, 1, 1), "Set(1) should succeed")
+	c.Wait()
+	val, ok := c.Get(1)
+	require.True(t, ok, "key 1 must be in cache")
+	require.Equal(t, 1, val, "value for key 1")
+	require.Equal(t, uint64(1), c.Metrics.KeysAdded(), "final KeysAdded")
+}
+
+func TestCacheMaxCost(t *testing.T) {
 
 	charset := "abcdefghijklmnopqrstuvwxyz0123456789"
 	key := func() []byte {
@@ -58,10 +515,11 @@ func TestCacheMaxCost(t *testing.T) {
 		return k
 	}
 	c, err := NewCache(&Config[[]byte, string]{
-		NumCounters: 12960, // 36^2 * 10
-		MaxCost:     1e6,   // 1mb
-		BufferItems: 64,
-		Metrics:     true,
+		NumCounters:           12960, // 36^2 * 10
+		MaxCost:               1e6,   // 1mb
+		BufferItems:           64,
+		Metrics:               true,
+		DisableAutoReallocate: true,
 	})
 	require.NoError(t, err)
 	stop := make(chan struct{}, 8)
@@ -477,8 +935,6 @@ func retrySet(t *testing.T, c *Cache[int, int], key, value int, cost int64, ttl 
 }
 
 func TestCacheSet(t *testing.T) {
-	t.Parallel()
-
 	c, err := NewCache(&Config[int, int]{
 		NumCounters:        100,
 		MaxCost:            10,
