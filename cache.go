@@ -91,6 +91,7 @@ type Cache[K Key, V any] struct {
 	bufferItems           int64
 	disableAutoReallocate bool
 	reallocating          atomic.Bool
+	reallocateMutex       sync.Mutex
 }
 
 // Config is passed to NewCache for creating new Cache instances.
@@ -299,34 +300,44 @@ func (c *Cache[K, V]) Wait() {
 	if c == nil || c.isClosed.Load() || c.reallocating.Load() {
 		return
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
 
 	wait := make(chan struct{})
 	select {
 	case c.setBuf <- &Item[K, V]{wait: wait}:
-		select {
-		case <-wait:
-		case <-ctx.Done():
-			// fmt.Println("Timeout waiting for sentinel in Wait")
-		}
-	case <-ctx.Done():
-		// fmt.Println("Timeout sending sentinel to setBuf in Wait")
-	}
-
-	// Drain setBuf synchronously
-	for len(c.setBuf) > 0 {
-		select {
-		case i := <-c.setBuf:
+		<-wait
+	default:
+		// If channel is full, process some items to make space
+		for len(c.setBuf) >= setBufSize {
+			i := <-c.setBuf
 			if i.wait != nil {
 				close(i.wait)
+				continue
 			}
-		case <-ctx.Done():
-			// fmt.Println("Timeout draining setBuf in Wait")
-			return
-		default:
-			runtime.Gosched()
+			// Process item (same as in processItems)
+			switch i.flag {
+			case itemNew:
+				victims, added := c.cachePolicy.Add(i.Key, i.OriginalKey, i.Cost)
+				if added {
+					c.storedItems.Set(i)
+					c.Metrics.add(keyAdd, i.Key, 1)
+					c.Metrics.add(costAdd, i.Key, uint64(i.Cost))
+				} else {
+					c.onReject(i)
+				}
+				for _, victim := range victims {
+					victim.Conflict, victim.Value = c.storedItems.Del(victim.Key, 0)
+					c.onEvict(victim)
+				}
+			case itemUpdate:
+				c.cachePolicy.Update(i.Key, i.OriginalKey, i.Cost)
+			case itemDelete:
+				c.cachePolicy.Del(i.Key)
+				_, val := c.storedItems.Del(i.Key, i.Conflict)
+				c.onExit(val)
+			}
 		}
+		c.setBuf <- &Item[K, V]{wait: wait}
+		<-wait
 	}
 }
 
@@ -482,6 +493,8 @@ func (c *Cache[K, V]) Del(key K) {
 // and updates the cache's internal state atomically. It preserves TTLs and metrics.
 // Reallocate doubles the MaxCost, copies all key-value pairs, and updates internal state.
 func (c *Cache[K, V]) Reallocate() error {
+	c.reallocateMutex.Lock()
+	defer c.reallocateMutex.Unlock()
 	if c == nil || c.isClosed.Load() {
 		return errors.New("cache is nil or closed")
 	}
@@ -807,25 +820,16 @@ func (c *Cache[K, V]) Clear() {
 	if c == nil || c.isClosed.Load() || c.reallocating.Load() {
 		return
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
 
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	// Stop processItems
-	select {
-	case c.stop <- struct{}{}:
-		select {
-		case <-c.done:
-		case <-ctx.Done():
-			// fmt.Println("Timeout waiting for processItems to stop in Clear")
-		}
-	case <-ctx.Done():
-		// fmt.Println("Timeout sending stop signal in Clear")
-	}
+	// Block until processItems goroutine is returned.
+	c.stop <- struct{}{}
+	<-c.done
+
 	// Clear out the setBuf channel.
 loop:
-	for len(c.setBuf) > 0 {
+	for {
 		select {
 		case i := <-c.setBuf:
 			if i.wait != nil {
@@ -833,12 +837,15 @@ loop:
 				continue
 			}
 			if i.flag != itemUpdate {
+				// In itemUpdate, the value is already set in the storedItems.  So, no need to call
+				// onEvict here.
 				c.onEvict(i)
 			}
-		case <-ctx.Done():
+		default:
 			break loop
 		}
 	}
+
 	// Clear value hashmap and cachePolicy data.
 	c.cachePolicy.Clear()
 	c.storedItems.Clear(c.onEvict)
