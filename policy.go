@@ -30,6 +30,7 @@ type defaultPolicy[K Key, V any] struct {
 	itemsCh  chan []uint64
 	stop     chan struct{}
 	done     chan struct{}
+	wg       sync.WaitGroup
 	isClosed bool
 	metrics  *Metrics
 }
@@ -42,6 +43,7 @@ func newDefaultPolicy[K Key, V any](numCounters, maxCost int64) *defaultPolicy[K
 		stop:    make(chan struct{}),
 		done:    make(chan struct{}),
 	}
+	p.wg.Add(1)
 	go p.processItems()
 	return p
 }
@@ -58,6 +60,7 @@ type policyPair[K Key] struct {
 }
 
 func (p *defaultPolicy[K, V]) processItems() {
+	defer p.wg.Done()
 	for {
 		select {
 		case items := <-p.itemsCh:
@@ -209,6 +212,7 @@ func (p *defaultPolicy[K, V]) Close() {
 	// Block until the p.processItems goroutine returns.
 	p.stop <- struct{}{}
 	<-p.done
+	p.wg.Wait()
 	close(p.stop)
 	close(p.done)
 	close(p.itemsCh)

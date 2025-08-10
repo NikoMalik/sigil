@@ -686,7 +686,7 @@ func (c *Cache[K, V]) Close() {
 	if !c.disableAutoReallocate {
 		close(c.monitorStop)
 		select {
-		case <-time.After(100 * time.Millisecond):
+		case <-time.After(500 * time.Millisecond):
 			// fmt.Println("Timeout waiting for monitorAndReallocate to stop")
 		default:
 			c.monitorWG.Wait()
