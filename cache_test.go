@@ -22,7 +22,6 @@ import (
 var wait = time.Millisecond * 10
 
 func TestCacheKeyToHash(t *testing.T) {
-
 	keyToHashCount := 0
 	c, err := NewCache(&Config[int, int]{
 		NumCounters:        10,
@@ -123,7 +122,6 @@ func TestReallocateConcurrency(t *testing.T) {
 }
 
 func TestReallocateMultipleTimes(t *testing.T) {
-
 	c, err := NewCache(&Config[int, int]{
 		NumCounters:           1000,
 		MaxCost:               10,

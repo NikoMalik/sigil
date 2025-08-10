@@ -316,10 +316,7 @@ func (c *Cache[K, V]) Wait() {
 // value was found or not. The value can be nil and the boolean can be true at
 // the same time. Get will not return expired items.
 func (c *Cache[K, V]) Get(key K) (V, bool) {
-	if c == nil || c.isClosed.Load() {
-		return zeroValue[V](), false
-	}
-	if c.reallocating.Load() {
+	if c == nil || c.isClosed.Load() || c.reallocating.Load() {
 		return zeroValue[V](), false
 	}
 	c.mu.RLock()
@@ -389,13 +386,9 @@ func (c *Cache[K, V]) Set(key K, value V, cost int64) bool {
 //
 // See Set for more information.
 func (c *Cache[K, V]) SetWithTTL(key K, value V, cost int64, ttl time.Duration) bool {
-	if c == nil || c.isClosed.Load() {
+	if c == nil || c.isClosed.Load() || c.reallocating.Load() {
 		return false
 	}
-	if c.reallocating.Load() {
-		return false
-	}
-
 	var expiration time.Time
 	switch {
 	case ttl == 0:
