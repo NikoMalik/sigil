@@ -30,7 +30,7 @@ Sigil is a feature fork; it is intended to be a drop-in replacement for most use
 
 
 ## Usage (example)
-The public API mirrors Ristretto; the two differences are: the `Iter` method and the `DisableAutoReallocate`/`AutoReallocateThreshold` config fields. Example usage:
+The public API mirrors Ristretto; the two differences are: the `Iter` method and the `DisableAutoReallocate` config fields. Example usage:
 
 ```go
 package main
