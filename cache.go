@@ -303,12 +303,17 @@ func (c *Cache[K, V]) Wait() {
 	case c.setBuf <- &Item[K, V]{wait: wait}:
 		select {
 		case <-wait:
-			// fmt.Println("Wait completed")
 		case <-time.After(100 * time.Millisecond):
-			// fmt.Println("Wait timed out")
+			// fmt.Println("Timeout waiting for sentinel in Wait")
 		}
 	case <-time.After(100 * time.Millisecond):
-		// fmt.Println("setBuf full, Wait skipped")
+		// fmt.Println("Timeout sending sentinel to setBuf in Wait")
+	}
+
+	// Wait until setBuf is empty
+	for len(c.setBuf) > 0 {
+		runtime.Gosched()
+		time.Sleep(1 * time.Millisecond)
 	}
 }
 
@@ -485,9 +490,13 @@ func (c *Cache[K, V]) Reallocate() error {
 	// Stop processing to ensure consistent state
 	select {
 	case c.stop <- struct{}{}:
+		select {
+		case <-c.done:
+		case <-time.After(100 * time.Millisecond):
+		}
 	case <-time.After(100 * time.Millisecond):
 	}
-	<-c.done
+
 	// Drain setBuf to process pending operations
 	for len(c.setBuf) > 0 {
 		select {
@@ -579,6 +588,7 @@ func (c *Cache[K, V]) Reallocate() error {
 	// oldStore.Clear(c.onEvict)
 	oldStore.ClearNoExit() //clear without close
 	oldPolicy.Clear()
+	oldPolicy.Close()
 
 	// Update metrics
 	if c.Metrics != nil {
@@ -669,32 +679,63 @@ func (c *Cache[K, V]) Close() {
 	if c == nil || c.isClosed.Load() || c.reallocating.Load() {
 		return
 	}
-	// c.mu.Lock()
-	// defer c.mu.Unlock()
 
-	// Mark as closed first to prevent new operations
 	c.isClosed.Store(true)
 
+	// Stop monitorAndReallocate
 	if !c.disableAutoReallocate {
 		close(c.monitorStop)
-		c.monitorWG.Wait()
+		select {
+		case <-time.After(100 * time.Millisecond):
+			// fmt.Println("Timeout waiting for monitorAndReallocate to stop")
+		default:
+			c.monitorWG.Wait()
+		}
 	}
 
-	c.Clear()
-
-	// Stop processing goroutines
-	close(c.stop)
-
-	// Wait for goroutines to finish
+	// Stop processItems
 	select {
-	case <-c.done:
+	case c.stop <- struct{}{}:
+		select {
+		case <-c.done:
+		case <-time.After(100 * time.Millisecond):
+			// fmt.Println("Timeout waiting for processItems to stop")
+		}
 	case <-time.After(100 * time.Millisecond):
+		// fmt.Println("Timeout sending stop signal to processItems")
 	}
 
-	// Close other resources
+	// Clear resources without restarting processItems
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+zaloop:
+	for len(c.setBuf) > 0 {
+		select {
+		case i := <-c.setBuf:
+			if i.wait != nil {
+				close(i.wait)
+				continue
+			}
+			if i.flag != itemUpdate {
+				c.onEvict(i)
+			}
+		default:
+			break zaloop
+		}
+	}
+
+	c.cachePolicy.Clear()
+	c.storedItems.Clear(c.onEvict)
+	c.cachePolicy.Close()
+
+	if c.Metrics != nil {
+		c.Metrics.Clear()
+	}
+
+	// Close resources
 	close(c.setBuf)
 	close(c.done)
-	c.cachePolicy.Close()
 	if c.cleanupTicker != nil {
 		c.cleanupTicker.Stop()
 	}

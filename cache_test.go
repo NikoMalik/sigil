@@ -234,6 +234,184 @@ func TestCache_AutoReallocate(t *testing.T) {
 		cache.MaxCost(), cache.MaxCost()-cache.RemainingCost(), cache.Metrics.KeysAdded())
 }
 
+func TestBoundaryConditions(t *testing.T) {
+	c, err := NewCache(&Config[int, int]{
+		NumCounters: 1,
+		MaxCost:     1,
+		BufferItems: 1,
+	})
+	require.NoError(t, err)
+
+	require.True(t, c.Set(0, 0, 0))
+	c.Wait()
+
+	require.True(t, c.Set(1, 1, 1))
+	c.Wait()
+
+	_, ok := c.Get(0)
+	require.False(t, ok)
+}
+
+func TestLargeDataSet(t *testing.T) {
+	const numItems = 100000
+	c, err := NewCache(&Config[int, int]{
+		NumCounters:        numItems * 10,
+		MaxCost:            numItems * 2,
+		IgnoreInternalCost: true,
+		BufferItems:        64,
+	})
+	require.NoError(t, err)
+
+	for i := 0; i < numItems; i++ {
+		c.Set(i, i, 1)
+	}
+	c.Wait()
+
+	require.NoError(t, c.Reallocate())
+
+	for i := 0; i < numItems; i++ {
+		val, ok := c.Get(i)
+		require.True(t, ok)
+		require.Equal(t, i, val)
+	}
+}
+
+func TestExpiredItemsCleanup(t *testing.T) {
+	c, err := NewCache(&Config[int, int]{
+		NumCounters:            100,
+		MaxCost:                10,
+		BufferItems:            64,
+		TtlTickerDurationInSec: 1,
+		IgnoreInternalCost:     true,
+	})
+	require.NoError(t, err)
+
+	c.SetWithTTL(1, 1, 1, 100*time.Millisecond)
+	c.SetWithTTL(2, 2, 1, 200*time.Millisecond)
+	c.SetWithTTL(3, 3, 1, 0)
+
+	time.Sleep(300 * time.Millisecond)
+
+	c.storedItems.Cleanup(c.cachePolicy, func(i *Item[int, int]) {})
+
+	_, ok := c.Get(3)
+	require.True(t, ok)
+}
+
+func TestConcurrentReadWrite(t *testing.T) {
+	c, err := NewCache(&Config[int, int]{
+		NumCounters: 1000,
+		MaxCost:     100,
+		BufferItems: 64,
+	})
+	require.NoError(t, err)
+
+	var wg sync.WaitGroup
+	const numWorkers = 10
+	const numOps = 100
+
+	for i := 0; i < numWorkers; i++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			for j := 0; j < numOps; j++ {
+				key := id*1000 + j
+				c.Set(key, key, 1)
+			}
+		}(i)
+	}
+
+	for i := 0; i < numWorkers; i++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			for j := 0; j < numOps; j++ {
+				key := id*1000 + j
+				c.Get(key)
+			}
+		}(i)
+	}
+
+	for i := 0; i < 3; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			time.Sleep(time.Duration(rand.Intn(50)) * time.Millisecond)
+			c.Reallocate()
+		}()
+	}
+
+	wg.Wait()
+
+	count := 0
+	c.Iter(func(k int, v int) bool {
+		val, ok := c.Get(k)
+		require.True(t, ok)
+		require.Equal(t, k, val)
+		count++
+		return false
+	})
+	t.Logf("Final cache size: %d items", count)
+}
+
+func TestGoroutineLeak(t *testing.T) {
+	runtime.GC()
+	initial := runtime.NumGoroutine()
+	t.Logf("Initial goroutines: %d", initial)
+
+	for i := 0; i < 10; i++ {
+		c, err := NewCache(&Config[int, int]{
+			NumCounters: 100,
+			MaxCost:     10,
+			BufferItems: 64,
+		})
+		require.NoError(t, err)
+		err = c.Reallocate()
+		require.NoError(t, err)
+		c.Close()
+	}
+
+	time.Sleep(1 * time.Second)
+	runtime.GC()
+
+	current := runtime.NumGoroutine()
+	t.Logf("Final goroutines: %d", current)
+	if current > initial+5 {
+		buf := make([]byte, 1<<16)
+		runtime.Stack(buf, true)
+		t.Logf("Goroutine stack: %s", buf)
+	}
+	require.LessOrEqual(t, current, initial+5, "goroutine leak detected")
+}
+
+func TestCacheUpdate(t *testing.T) {
+	c, err := NewCache(&Config[int, int]{
+		NumCounters:        100,
+		MaxCost:            10,
+		BufferItems:        64,
+		IgnoreInternalCost: true,
+		ShouldUpdate: func(cur, prev int) bool {
+			return cur > prev
+		},
+	})
+	require.NoError(t, err)
+
+	require.True(t, c.Set(1, 1, 1))
+	c.Wait()
+
+	require.True(t, c.Set(1, 2, 1))
+	c.Wait()
+	val, ok := c.Get(1)
+	require.True(t, ok)
+	require.Equal(t, 2, val)
+
+	require.True(t, c.Set(1, 1, 1))
+	c.Wait()
+	val, ok = c.Get(1)
+	require.True(t, ok)
+	require.Equal(t, 2, val)
+}
+
 func TestReallocateConcurrency(t *testing.T) {
 	cache, err := NewCache(&Config[int, int]{
 		NumCounters: 1000,
