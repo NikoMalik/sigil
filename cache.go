@@ -10,6 +10,7 @@ package ristretto
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"runtime"
@@ -25,12 +26,12 @@ var setBufSize int
 
 func init() {
 	cores := runtime.NumCPU()
-	setBufSize = 32 * 1024 // default
+	setBufSize = 64 * 1024
 
 	if cores > 32 {
-		setBufSize = 256 * 1024
+		setBufSize = 512 * 1024
 	} else if cores > 8 {
-		setBufSize = 64 * 1024
+		setBufSize = 128 * 1024
 	} else if cores <= 2 {
 		setBufSize = 1 * 1024
 	}
@@ -293,27 +294,39 @@ func NewCache[K Key, V any](config *Config[K, V]) (*Cache[K, V], error) {
 
 // Wait blocks until all buffered writes have been applied. This ensures a call to Set()
 // will be visible to future calls to Get().
+// Wait blocks until all buffered writes have been applied.
 func (c *Cache[K, V]) Wait() {
 	if c == nil || c.isClosed.Load() || c.reallocating.Load() {
 		return
 	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
 
 	wait := make(chan struct{})
 	select {
 	case c.setBuf <- &Item[K, V]{wait: wait}:
 		select {
 		case <-wait:
-		case <-time.After(100 * time.Millisecond):
+		case <-ctx.Done():
 			// fmt.Println("Timeout waiting for sentinel in Wait")
 		}
-	case <-time.After(100 * time.Millisecond):
+	case <-ctx.Done():
 		// fmt.Println("Timeout sending sentinel to setBuf in Wait")
 	}
 
-	// Wait until setBuf is empty
+	// Drain setBuf synchronously
 	for len(c.setBuf) > 0 {
-		runtime.Gosched()
-		time.Sleep(1 * time.Millisecond)
+		select {
+		case i := <-c.setBuf:
+			if i.wait != nil {
+				close(i.wait)
+			}
+		case <-ctx.Done():
+			// fmt.Println("Timeout draining setBuf in Wait")
+			return
+		default:
+			runtime.Gosched()
+		}
 	}
 }
 
@@ -482,6 +495,8 @@ func (c *Cache[K, V]) Reallocate() error {
 		}
 		c.reallocating.Store(false)
 	}()
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
 
 	// Lock to prevent concurrent operations
 	c.mu.Lock()
@@ -492,9 +507,9 @@ func (c *Cache[K, V]) Reallocate() error {
 	case c.stop <- struct{}{}:
 		select {
 		case <-c.done:
-		case <-time.After(100 * time.Millisecond):
+		case <-ctx.Done():
 		}
-	case <-time.After(100 * time.Millisecond):
+	case <-ctx.Done():
 	}
 
 	// Drain setBuf to process pending operations
@@ -639,9 +654,9 @@ func (c *Cache[K, V]) clear() {
 	case c.stop <- struct{}{}:
 		select {
 		case <-c.done:
-		case <-time.After(100 * time.Millisecond):
+		case <-time.After(500 * time.Millisecond):
 		}
-	case <-time.After(100 * time.Millisecond):
+	case <-time.After(500 * time.Millisecond):
 	}
 
 	// Clear out the setBuf channel.
@@ -682,11 +697,14 @@ func (c *Cache[K, V]) Close() {
 
 	c.isClosed.Store(true)
 
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
 	// Stop monitorAndReallocate
 	if !c.disableAutoReallocate {
 		close(c.monitorStop)
 		select {
-		case <-time.After(500 * time.Millisecond):
+		case <-ctx.Done():
 			// fmt.Println("Timeout waiting for monitorAndReallocate to stop")
 		default:
 			c.monitorWG.Wait()
@@ -698,17 +716,15 @@ func (c *Cache[K, V]) Close() {
 	case c.stop <- struct{}{}:
 		select {
 		case <-c.done:
-		case <-time.After(100 * time.Millisecond):
+		case <-ctx.Done():
 			// fmt.Println("Timeout waiting for processItems to stop")
 		}
-	case <-time.After(100 * time.Millisecond):
+	case <-ctx.Done():
 		// fmt.Println("Timeout sending stop signal to processItems")
 	}
-
 	// Clear resources without restarting processItems
 	c.mu.Lock()
 	defer c.mu.Unlock()
-
 zaloop:
 	for len(c.setBuf) > 0 {
 		select {
@@ -720,7 +736,8 @@ zaloop:
 			if i.flag != itemUpdate {
 				c.onEvict(i)
 			}
-		default:
+		case <-ctx.Done():
+			// fmt.Println("Timeout draining setBuf in Close")
 			break zaloop
 		}
 	}
@@ -790,16 +807,25 @@ func (c *Cache[K, V]) Clear() {
 	if c == nil || c.isClosed.Load() || c.reallocating.Load() {
 		return
 	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
 
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	// Block until processItems goroutine is returned.
-	c.stop <- struct{}{}
-	<-c.done
-
+	// Stop processItems
+	select {
+	case c.stop <- struct{}{}:
+		select {
+		case <-c.done:
+		case <-ctx.Done():
+			// fmt.Println("Timeout waiting for processItems to stop in Clear")
+		}
+	case <-ctx.Done():
+		// fmt.Println("Timeout sending stop signal in Clear")
+	}
 	// Clear out the setBuf channel.
 loop:
-	for {
+	for len(c.setBuf) > 0 {
 		select {
 		case i := <-c.setBuf:
 			if i.wait != nil {
@@ -807,15 +833,12 @@ loop:
 				continue
 			}
 			if i.flag != itemUpdate {
-				// In itemUpdate, the value is already set in the storedItems.  So, no need to call
-				// onEvict here.
 				c.onEvict(i)
 			}
-		default:
+		case <-ctx.Done():
 			break loop
 		}
 	}
-
 	// Clear value hashmap and cachePolicy data.
 	c.cachePolicy.Clear()
 	c.storedItems.Clear(c.onEvict)
