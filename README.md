@@ -5,7 +5,7 @@
 
 Sigil is a conservative fork of Ristretto (a fast, concurrent cache library) that maintains the original codebase and APIs while adding two pragmatic features requested by maintainers and users:
 
-- `` — an iterator over the cache that allows callers to visit every key/value pair currently stored in the cache in a safe manner.
+- **Iter** — an iterator over the cache that allows callers to visit every key/value pair currently stored in the cache in a safe manner.
 - **Automatic reallocation** — background monitoring that will automatically trigger a reallocation (grow the cache capacity) when usage crosses a configurable threshold. The goal is to reduce manual intervention when a cache grows under load.
 
 > Note: This fork intentionally keeps the original semantics and behaviour of Ristretto. Where behaviours change (for example, the semantics of `Iter` or reallocation), they are documented below.

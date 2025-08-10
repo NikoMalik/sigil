@@ -45,8 +45,44 @@ func keyToHash[K Key](key K) (uint64, uint64) {
 	panic("unsupported")
 }
 
-// wyhash faster version
+const DefaultSeed = 0xa0761d6478bd642f
+
 func KeyToHash[K Key](key K) (uint64, uint64) {
+	switch k := any(key).(type) {
+	case uint64:
+		return k, 0
+	case string:
+		ptr := unsafe.Pointer(unsafe.StringData(k))
+		size := uintptr(len(k))
+		h1 := MemHashString(k)                // first hash
+		h2 := memhash(ptr, DefaultSeed, size) // secondhash
+		return uint64(h1), uint64(h2)
+	case []byte:
+		var ptr unsafe.Pointer
+		if len(k) > 0 {
+			ptr = unsafe.Pointer(&k[0])
+		}
+		size := uintptr(len(k))
+		h1 := MemHash(k)                      // first hash
+		h2 := memhash(ptr, DefaultSeed, size) // second hash
+		return uint64(h1), uint64(h2)
+	case byte:
+		return uint64(k), 0
+	case int:
+		return uint64(k), 0
+	case int32:
+		return uint64(k), 0
+	case uint32:
+		return uint64(k), 0
+	case int64:
+		return uint64(k), 0
+	default:
+		panic("Key type not supported")
+	}
+}
+
+// wyhash faster version
+func keyToHashWyHash[K Key](key K) (uint64, uint64) {
 	keyAsAny := any(key)
 	switch k := keyAsAny.(type) {
 	case uint64:
