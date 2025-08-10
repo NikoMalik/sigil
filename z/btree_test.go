@@ -414,6 +414,14 @@ func BenchmarkSearch(b *testing.B) {
 			return n.key(i) >= k
 		})
 	}
+
+	smd := func(n node, k uint64, N int) int {
+		if len(n[:2*N]) < 8 {
+			return int(simd.Naive(n[:2*N], k))
+		}
+		return int(simd.SearchSimd(n[:2*N], k))
+	}
+
 	unroll4 := func(n node, k uint64, N int) int {
 		if len(n[:2*N]) < 8 {
 			for i := 0; i < N; i++ {
@@ -423,7 +431,7 @@ func BenchmarkSearch(b *testing.B) {
 			}
 			return N
 		}
-		return int(simd.Search(n[:2*N], k))
+		return int(simd.SearchUnroll(n[:2*N], k))
 	}
 
 	jumpBy := []int{8, 16, 32, 64, 128, 196, 255}
@@ -456,6 +464,13 @@ func BenchmarkSearch(b *testing.B) {
 				tmp = unroll4(n, math.MaxUint64, sz)
 			}
 		})
+
+		b.Run(fmt.Sprintf("simd-%d", sz), func(b *testing.B) {
+			for i := 0; i < b.N; i++ {
+				tmp = smd(n, math.MaxUint64, sz)
+			}
+		})
+
 		mf.Close(0)
 		os.Remove(f.Name())
 	}
@@ -501,6 +516,19 @@ func BenchmarkCustomSearch(b *testing.B) {
 		return N
 	}
 
+	binary := func(n node, k uint64, N int) int {
+		return sort.Search(N, func(i int) bool {
+			return n.key(i) >= k
+		})
+	}
+
+	smd := func(n node, k uint64, N int) int {
+		if len(n[:2*N]) < 8 {
+			return int(simd.Naive(n[:2*N], k))
+		}
+		return int(simd.SearchSimd(n[:2*N], k))
+	}
+
 	for _, sz := range []int{64, 128, 255} {
 		n := getNode(make([]byte, pageSize))
 		for i := 1; i <= sz; i++ {
@@ -516,5 +544,18 @@ func BenchmarkCustomSearch(b *testing.B) {
 				}
 			})
 		}
+		b.Run(fmt.Sprintf("simd-sz-%d", sz), func(b *testing.B) {
+			for i := 0; i < b.N; i++ {
+				k := uint64(rand.Intn(mk))
+				tmp = smd(n, k, sz)
+			}
+		})
+		b.Run(fmt.Sprintf("binary-sz%d", sz), func(b *testing.B) {
+			for i := 0; i < b.N; i++ {
+				k := uint64(rand.Intn(mk))
+				tmp = binary(n, k, sz)
+			}
+		})
+
 	}
 }

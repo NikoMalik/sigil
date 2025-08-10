@@ -572,7 +572,14 @@ func (n node) search(k uint64) int {
 		}
 		return N
 	}
+	if N <= 8 {
+		return int(simd.Naive(n[:2*N], k))
+	}
 	return int(simd.Search(n[:2*N], k))
+	// return sort.Search(N, func(i int) bool {
+	// 	return n.key(i) >= k
+	// })
+
 	// lo, hi := 0, N
 	// // Reduce the search space using binary seach and then do linear search.
 	// for hi-lo > 32 {

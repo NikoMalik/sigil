@@ -12,13 +12,14 @@ import (
 
 	"github.com/cespare/xxhash/v2"
 	"github.com/goccy/go-reflect"
+	"github.com/zhangyunhao116/wyhash"
 )
 
 type Key interface {
 	uint64 | string | []byte | byte | int | int32 | uint32 | int64
 }
 
-func KeyToHash[K Key](key K) (uint64, uint64) {
+func keyToHash[K Key](key K) (uint64, uint64) {
 	t := reflect.ValueNoEscapeOf(key)
 	switch t.Kind() {
 	case reflect.Uint64:
@@ -42,6 +43,31 @@ func KeyToHash[K Key](key K) (uint64, uint64) {
 		panic("unsupported type")
 	}
 	panic("unsupported")
+}
+
+// wyhash faster version
+func KeyToHash[K Key](key K) (uint64, uint64) {
+	keyAsAny := any(key)
+	switch k := keyAsAny.(type) {
+	case uint64:
+		return k, 0
+	case string:
+		return MemHashString(k), wyhash.Sum64String(k)
+	case []byte:
+		return MemHash(k), wyhash.Sum64(k)
+	case byte:
+		return uint64(k), 0
+	case int:
+		return uint64(k), 0
+	case int32:
+		return uint64(k), 0
+	case uint32:
+		return uint64(k), 0
+	case int64:
+		return uint64(k), 0
+	default:
+		panic("Key type not supported")
+	}
 }
 
 // func KeyToHash[K Key](key K) (uint64, uint64) {
