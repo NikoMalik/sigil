@@ -8,10 +8,12 @@ package ristretto
 import (
 	"fmt"
 	"math/rand"
+	"os"
 	"runtime"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -42,6 +44,148 @@ func TestCacheKeyToHash(t *testing.T) {
 		c.Del(1)
 	}
 	require.Equal(t, 3, keyToHashCount)
+}
+
+func TestReallocateConcurrentAccess(t *testing.T) {
+	c, err := NewCache(&Config[int, int]{
+		NumCounters: 1000,
+		MaxCost:     100,
+		BufferItems: 64,
+	})
+	require.NoError(t, err)
+
+	var wg sync.WaitGroup
+	stop := make(chan struct{})
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		i := 0
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+				c.Set(i%100, i, 1)
+				i++
+			}
+		}
+	}()
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+				c.Get(rand.Intn(100))
+			}
+		}
+	}()
+
+	for i := 0; i < 5; i++ {
+		time.Sleep(10 * time.Millisecond)
+		require.NoError(t, c.Reallocate())
+	}
+
+	close(stop)
+	wg.Wait()
+
+	keys := 0
+	c.Iter(func(k int, v int) bool {
+		val, ok := c.Get(k)
+		require.True(t, ok)
+		require.Equal(t, v, val)
+		keys++
+		return false
+	})
+	require.True(t, keys > 0, "cache should not be empty")
+}
+
+func TestReallocateTTLPreservation(t *testing.T) {
+	c, err := NewCache(&Config[int, int]{
+		NumCounters:        100,
+		MaxCost:            10,
+		BufferItems:        64,
+		IgnoreInternalCost: true,
+	})
+	require.NoError(t, err)
+
+	require.True(t, c.SetWithTTL(1, 1, 1, 5*time.Minute))
+	require.True(t, c.SetWithTTL(2, 2, 1, 10*time.Minute))
+	require.True(t, c.SetWithTTL(3, 3, 1, 0))
+
+	c.Wait()
+
+	require.NoError(t, c.Reallocate())
+
+	checkTTL := func(key int, expectedTTL time.Duration) {
+		val, ok := c.Get(key)
+		require.True(t, ok)
+		require.Equal(t, key, val)
+
+		ttl, ok := c.GetTTL(key)
+		if expectedTTL == 0 {
+			require.True(t, ok)
+			require.Equal(t, time.Duration(0), ttl)
+		} else {
+			require.True(t, ok)
+			require.InDelta(t, expectedTTL.Seconds(), ttl.Seconds(), 1.0)
+		}
+	}
+
+	checkTTL(1, 5*time.Minute)
+	checkTTL(2, 10*time.Minute)
+	checkTTL(3, 0)
+}
+
+// The test expects Reallocate to preserve all key-value pairs (including *os.File values) in the new store without closing files in the old store.
+func TestReallocateResourceLeak(t *testing.T) {
+	var leaks int32
+	c, err := NewCache(&Config[int, *os.File]{
+		NumCounters: 100,
+		MaxCost:     10,
+
+		BufferItems:        64,
+		IgnoreInternalCost: true,
+		OnExit: func(f *os.File) {
+			if f != nil {
+				f.Close()
+				atomic.AddInt32(&leaks, 1)
+			}
+		},
+	})
+	require.NoError(t, err)
+
+	files := make([]*os.File, 5)
+	for i := 0; i < 5; i++ {
+		f, _ := os.CreateTemp("", "test")
+		files[i] = f
+		require.True(t, c.Set(i, f, 1))
+	}
+	c.Wait()
+
+	// Realloc doesnt mean to close files
+	require.NoError(t, c.Reallocate())
+	require.Equal(t, int32(0), atomic.LoadInt32(&leaks), "no leaks after reallocate")
+
+	for i := 0; i < 5; i++ {
+		f, ok := c.Get(i)
+		require.True(t, ok)
+		_, err = f.WriteString("test")
+		require.NoError(t, err, "file should still be writable")
+	}
+
+	c.Clear()
+	c.Wait()
+	require.Equal(t, int32(5), atomic.LoadInt32(&leaks), "all leaks accounted for after clear")
+
+	for _, f := range files {
+		_, err = f.WriteString("test")
+		require.Error(t, err, "file should be closed")
+	}
 }
 
 func TestCache_AutoReallocate(t *testing.T) {

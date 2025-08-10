@@ -49,6 +49,8 @@ type store[K Key, V any] interface {
 	// It guarantees that any key in the Map will be visited only once.
 	// The set of keys visited by Iter is non-deterministic.
 	Iter(cb func(k K, v V) (stop bool))
+
+	ClearNoExit()
 }
 
 // newStore returns the default store implementation.
@@ -59,13 +61,13 @@ func newStore[K Key, V any]() store[K, V] {
 const numShards uint64 = 256
 
 type shardedMap[K Key, V any] struct {
-	shards    []*lockedMap[K, V]
+	shards    [numShards]*lockedMap[K, V]
 	expiryMap *expirationMap[K, V]
 }
 
 func newShardedMap[K Key, V any]() *shardedMap[K, V] {
 	sm := &shardedMap[K, V]{
-		shards:    make([]*lockedMap[K, V], int(numShards)),
+		// shards:    make([]*lockedMap[K, V], int(numShards)),
 		expiryMap: newExpirationMap[K, V](),
 	}
 	for i := range sm.shards {
@@ -78,6 +80,13 @@ func (m *shardedMap[_, V]) SetShouldUpdateFn(f updateFn[V]) {
 	for i := range m.shards {
 		m.shards[i].setShouldUpdateFn(f)
 	}
+}
+
+func (sm *shardedMap[K, V]) ClearNoExit() {
+	for i := uint64(0); i < numShards; i++ {
+		sm.shards[i].ClearNoExit()
+	}
+	sm.expiryMap.clear()
 }
 
 // Iter iterates the elements of the Map, passing them to the callback.
@@ -152,6 +161,12 @@ func newLockedMap[K Key, V any](em *expirationMap[K, V]) *lockedMap[K, V] {
 			return true
 		},
 	}
+}
+
+func (m *lockedMap[K, V]) ClearNoExit() {
+	m.Lock()
+	defer m.Unlock()
+	m.data = make(map[uint64]storeItem[K, V])
 }
 
 func (m *lockedMap[K, V]) setShouldUpdateFn(f updateFn[V]) {

@@ -518,7 +518,11 @@ func (c *Cache[K, V]) Reallocate() error {
 				c.onExit(val)
 			}
 		default:
-			break
+			if len(c.setBuf) == 0 {
+				break
+			}
+			// Allow other goroutines to run, preventing starvation
+			runtime.Gosched()
 		}
 	}
 	oldStore := c.storedItems
@@ -572,7 +576,8 @@ func (c *Cache[K, V]) Reallocate() error {
 	c.storedItems = newStore
 	c.cachePolicy = newPolicy
 
-	oldStore.Clear(c.onEvict)
+	// oldStore.Clear(c.onEvict)
+	oldStore.ClearNoExit() //clear without close
 	oldPolicy.Clear()
 
 	// Update metrics
