@@ -72,7 +72,7 @@ type Cache[K Key, V any] struct {
 	stop        chan struct{}
 	done        chan struct{}
 	monitorStop chan struct{} // New channel for monitorAndReallocate
-	monitorDone chan struct{} // New channel for monitorAndReallocate
+	monitorWG   sync.WaitGroup
 	// indicates whether cache is closed.
 	isClosed atomic.Bool
 	// cost calculates cost from a value.
@@ -248,7 +248,6 @@ func NewCache[K Key, V any](config *Config[K, V]) (*Cache[K, V], error) {
 		stop:                  make(chan struct{}),
 		done:                  make(chan struct{}),
 		monitorStop:           make(chan struct{}), // Initialize monitor channels
-		monitorDone:           make(chan struct{}),
 		cost:                  config.Cost,
 		ignoreInternalCost:    config.IgnoreInternalCost,
 		cleanupTicker:         time.NewTicker(time.Duration(config.TtlTickerDurationInSec) * time.Second / 2),
@@ -286,6 +285,7 @@ func NewCache[K Key, V any](config *Config[K, V]) (*Cache[K, V], error) {
 	//       usually be sufficient
 	go cache.processItems()
 	if !cache.disableAutoReallocate {
+		cache.monitorWG.Add(1)
 		go cache.monitorAndReallocate(0.9, time.Second)
 	}
 	return cache, nil
@@ -294,10 +294,7 @@ func NewCache[K Key, V any](config *Config[K, V]) (*Cache[K, V], error) {
 // Wait blocks until all buffered writes have been applied. This ensures a call to Set()
 // will be visible to future calls to Get().
 func (c *Cache[K, V]) Wait() {
-	if c == nil || c.isClosed.Load() {
-		return
-	}
-	if c.reallocating.Load() {
+	if c == nil || c.isClosed.Load() || c.reallocating.Load() {
 		return
 	}
 
@@ -307,10 +304,10 @@ func (c *Cache[K, V]) Wait() {
 		select {
 		case <-wait:
 			// fmt.Println("Wait completed")
-		case <-time.After(1 * time.Second):
+		case <-time.After(100 * time.Millisecond):
 			// fmt.Println("Wait timed out")
 		}
-	case <-time.After(1 * time.Second):
+	case <-time.After(100 * time.Millisecond):
 		// fmt.Println("setBuf full, Wait skipped")
 	}
 }
@@ -341,6 +338,7 @@ func (c *Cache[K, V]) Get(key K) (V, bool) {
 func (c *Cache[K, V]) monitorAndReallocate(threshold float64, checkInterval time.Duration) {
 	ticker := time.NewTicker(checkInterval)
 	defer ticker.Stop()
+	defer c.monitorWG.Done()
 	for {
 		select {
 		case <-ticker.C:
@@ -350,11 +348,9 @@ func (c *Cache[K, V]) monitorAndReallocate(threshold float64, checkInterval time
 			if c.reallocating.Load() {
 				continue
 			}
-			c.mu.RLock()
 			max := c.cachePolicy.MaxCost()
 			rem := c.cachePolicy.Cap()
 			used := max - rem
-			c.mu.RUnlock()
 
 			if float64(used) >= threshold*float64(max) {
 				if err := c.Reallocate(); err != nil {
@@ -412,8 +408,8 @@ func (c *Cache[K, V]) SetWithTTL(key K, value V, cost int64, ttl time.Duration) 
 		expiration = time.Now().Add(ttl)
 	}
 
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	// c.mu.RLock()
+	// defer c.mu.RUnlock()
 
 	keyHash, conflictHash := c.keyToHash(key)
 	i := &Item[K, V]{
@@ -449,14 +445,12 @@ func (c *Cache[K, V]) SetWithTTL(key K, value V, cost int64, ttl time.Duration) 
 
 // Del deletes the key-value item from the cache if it exists.
 func (c *Cache[K, V]) Del(key K) {
-	if c == nil || c.isClosed.Load() {
+	if c == nil || c.isClosed.Load() || c.reallocating.Load() {
 		return
 	}
-	if c.reallocating.Load() {
-		return
-	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
+
+	// c.mu.Lock()
+	// defer c.mu.Unlock()
 
 	keyHash, conflictHash := c.keyToHash(key)
 	// Delete immediately.
@@ -498,7 +492,7 @@ func (c *Cache[K, V]) Reallocate() error {
 	// Stop processing to ensure consistent state
 	select {
 	case c.stop <- struct{}{}:
-	case <-time.After(1 * time.Second):
+	case <-time.After(100 * time.Millisecond):
 	}
 	<-c.done
 	// Drain setBuf to process pending operations
@@ -622,12 +616,6 @@ func (c *Cache[K, V]) Reallocate() error {
 
 	// Restart processing and monitoring
 	go c.processItems()
-	// if !c.disableAutoReallocate {
-	// 	c.monitorStop = make(chan struct{})
-	// 	c.monitorDone = make(chan struct{})
-	// 	// go c.monitorAndReallocate(0.9, time.Second)
-	// }
-
 	// fmt.Printf("Reallocate completed: new MaxCost=%d, copied keys=%d, cost=%d\n", newMax, copiedKeys, copiedCost)
 	return nil
 }
@@ -643,9 +631,9 @@ func (c *Cache[K, V]) clear() {
 	case c.stop <- struct{}{}:
 		select {
 		case <-c.done:
-		case <-time.After(1 * time.Second):
+		case <-time.After(100 * time.Millisecond):
 		}
-	case <-time.After(1 * time.Second):
+	case <-time.After(100 * time.Millisecond):
 	}
 
 	// Clear out the setBuf channel.
@@ -680,34 +668,34 @@ loop:
 
 // Close stops all goroutines and closes all channels.
 func (c *Cache[K, V]) Close() {
-	if c == nil || c.isClosed.Load() {
+	if c == nil || c.isClosed.Load() || c.reallocating.Load() {
 		return
 	}
-	if c.reallocating.Load() {
-		return
-	}
-	c.mu.RLock()
-	defer c.mu.RUnlock()
+	// c.mu.Lock()
+	// defer c.mu.Unlock()
 
 	// Mark as closed first to prevent new operations
 	c.isClosed.Store(true)
 
+	if !c.disableAutoReallocate {
+		close(c.monitorStop)
+		c.monitorWG.Wait()
+	}
+
+	c.Clear()
+
 	// Stop processing goroutines
 	close(c.stop)
-	close(c.monitorStop)
 
 	// Wait for goroutines to finish
 	select {
 	case <-c.done:
-	case <-time.After(1 * time.Second):
-	}
-	select {
-	case <-c.monitorDone:
-	case <-time.After(1 * time.Second):
+	case <-time.After(100 * time.Millisecond):
 	}
 
 	// Close other resources
 	close(c.setBuf)
+	close(c.done)
 	c.cachePolicy.Close()
 	if c.cleanupTicker != nil {
 		c.cleanupTicker.Stop()
@@ -718,15 +706,10 @@ func (c *Cache[K, V]) Close() {
 // It guarantees that any key in the Map will be visited only once.
 // The set of keys visited by Iter is non-deterministic.
 func (c *Cache[K, V]) Iter(cb func(k K, v V) (stop bool)) {
-	if c == nil || c.isClosed.Load() {
+	if c == nil || c.isClosed.Load() || c.reallocating.Load() {
 		return
 	}
-	if c.reallocating.Load() {
-		return
-	}
-	c.mu.RLock()
 	c.storedItems.Iter(cb)
-	c.mu.RUnlock()
 }
 
 // GetTTL returns the TTL for the specified key and a bool that is true if the
@@ -735,11 +718,11 @@ func (c *Cache[K, V]) GetTTL(key K) (time.Duration, bool) {
 	if c == nil {
 		return 0, false
 	}
-	if c.reallocating.Load() {
-		return 0, false
-	}
-	c.mu.RLock()
-	defer c.mu.RUnlock()
+	// if c.reallocating.Load() {
+	// 	return 0, false
+	// }
+	// c.mu.RLock()
+	// defer c.mu.RUnlock()
 
 	keyHash, conflictHash := c.keyToHash(key)
 	if _, ok := c.storedItems.Get(keyHash, conflictHash); !ok {
@@ -765,10 +748,7 @@ func (c *Cache[K, V]) GetTTL(key K) (time.Duration, bool) {
 // not an atomic operation (but that shouldn't be a problem as it's assumed that
 // Set/Get calls won't be occurring until after this).
 func (c *Cache[K, V]) Clear() {
-	if c == nil || c.isClosed.Load() {
-		return
-	}
-	if c.reallocating.Load() {
+	if c == nil || c.isClosed.Load() || c.reallocating.Load() {
 		return
 	}
 

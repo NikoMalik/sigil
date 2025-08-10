@@ -1,6 +1,6 @@
 test:
 	@echo "Running tests..."
-	@go test -v  ./...
+	@go test -v -race  ./...
 
 bench:
 	@echo "Running benches..."
