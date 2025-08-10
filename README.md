@@ -77,7 +77,7 @@ func main() {
 Sigil introduces an internal monitor that can be enabled by default. Behaviour summary:
 
 - The monitor periodically checks the cache occupancy (`used / MaxCost`).
-- If occupancy >= `AutoReallocateThreshold` (default 0.9), the cache calls `Reallocate()` which doubles the `MaxCost` and copies live items to a new store.
+- If occupancy >=  (default 0.9) 90%, the cache calls `Reallocate()` which doubles the `MaxCost` and copies live items to a new store.
 - Reallocation is guarded by an `atomic` flag; concurrent `Set`/`Get` operations return early when a reallocation is in progress.
 - Automatic reallocation can be disabled by setting `DisableAutoReallocate: true` in the `Config`.
 
