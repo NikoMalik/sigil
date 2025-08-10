@@ -1,4 +1,4 @@
-module github.com/NikoMalik/ristretto/v2
+module github.com/NikoMalik/sigil
 
 go 1.23.0
 

@@ -14,7 +14,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/NikoMalik/ristretto/v2/sim"
+	"github.com/NikoMalik/sigil/sim"
 	"github.com/stretchr/testify/require"
 )
 

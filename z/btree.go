@@ -12,7 +12,7 @@ import (
 	"strings"
 	"unsafe"
 
-	"github.com/NikoMalik/ristretto/v2/z/simd"
+	"github.com/NikoMalik/sigil/z/simd"
 )
 
 var (

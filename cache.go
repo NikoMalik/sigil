@@ -18,7 +18,7 @@ import (
 	"time"
 	"unsafe"
 
-	"github.com/NikoMalik/ristretto/v2/z"
+	"github.com/NikoMalik/sigil/z"
 )
 
 var setBufSize int

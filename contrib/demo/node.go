@@ -6,7 +6,7 @@ import (
 
 	"github.com/dustin/go-humanize"
 
-	"github.com/NikoMalik/ristretto/v2/z"
+	"github.com/NikoMalik/sigil/z"
 )
 
 type node struct {

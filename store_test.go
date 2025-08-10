@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/NikoMalik/ristretto/v2/z"
+	"github.com/NikoMalik/sigil/z"
 	"github.com/stretchr/testify/require"
 )
 

@@ -1,60 +1,36 @@
-# Ristretto
+# Sigil (fork of Ristretto)
 
-[![GitHub License](https://img.shields.io/github/license/hypermodeinc/ristretto)](https://github.com/hypermodeinc/ristretto?tab=Apache-2.0-1-ov-file#readme)
-[![chat](https://img.shields.io/discord/1267579648657850441)](https://discord.hypermode.com)
-[![GitHub Repo stars](https://img.shields.io/github/stars/hypermodeinc/ristretto)](https://github.com/hypermodeinc/ristretto/stargazers)
-[![GitHub commit activity](https://img.shields.io/github/commit-activity/m/hypermodeinc/ristretto)](https://github.com/hypermodeinc/ristretto/commits/main/)
-[![Go Report Card](https://img.shields.io/badge/go%20report-A%2B-brightgreen)](https://goreportcard.com/report/github.com/dgraph-io/ristretto)
+> **This repository is a fork of **[**Ristretto**](https://github.com/hypermodeinc/ristretto) and is published under the name **Sigil**. It preserves the original project's behavior and interfaces but introduces a few focused enhancements listed below.
 
-Ristretto is a fast, concurrent cache library built with a focus on performance and correctness.
 
-The motivation to build Ristretto comes from the need for a contention-free cache in [Dgraph][].
+Sigil is a conservative fork of Ristretto (a fast, concurrent cache library) that maintains the original codebase and APIs while adding two pragmatic features requested by maintainers and users:
 
-[Dgraph]: https://github.com/hypermodeinc/dgraph
+- `` — an iterator over the cache that allows callers to visit every key/value pair currently stored in the cache in a safe manner.
+- **Automatic reallocation** — background monitoring that will automatically trigger a reallocation (grow the cache capacity) when usage crosses a configurable threshold. The goal is to reduce manual intervention when a cache grows under load.
 
-## Features
+> Note: This fork intentionally keeps the original semantics and behaviour of Ristretto. Where behaviours change (for example, the semantics of `Iter` or reallocation), they are documented below.
 
-- **High Hit Ratios** - with our unique admission/eviction policy pairing, Ristretto's performance
-  is best in class.
-  - **Eviction: SampledLFU** - on par with exact LRU and better performance on Search and Database
-    traces.
-  - **Admission: TinyLFU** - extra performance with little memory overhead (12 bits per counter).
-- **Fast Throughput** - we use a variety of techniques for managing contention and the result is
-  excellent throughput.
-- **Cost-Based Eviction** - any large new item deemed valuable can evict multiple smaller items
-  (cost could be anything).
-- **Fully Concurrent** - you can use as many goroutines as you want with little throughput
-  degradation.
-- **Metrics** - optional performance metrics for throughput, hit ratios, and other stats.
-- **Simple API** - just figure out your ideal `Config` values and you're off and running.
+---
+
+## Features (Sigil additions)
+
+- Everything in Ristretto (TinyLFU admission, SampledLFU eviction, batching for throughput).
+- **Iter**: an exported method to iterate over all elements currently in the cache. Iter runs with minimal locking to avoid introducing contention; callbacks run outside of internal locks so user code won't deadlock the cache.
+- **Automatic reallocation**: optional monitoring goroutine that observes cache occupancy and automatically triggers `Reallocate()` when the cache reaches a configured threshold (for example 90%). This behavior can be disabled in the `Config`.
+
+---
 
 ## Status
 
-Ristretto is production-ready. See [Projects using Ristretto](#projects-using-ristretto).
+Sigil is a feature fork; it is intended to be a drop-in replacement for most uses of Ristretto while providing the two extensions above. Use in production requires the same care as for Ristretto: pick sensible `Config` values, enable metrics to observe behaviour, and test workloads.
+
+---
 
 ## Getting Started
 
-### Installing
 
-To start using Ristretto, install Go 1.21 or above. Ristretto needs go modules. From your project,
-run the following command
-
-```sh
-go get github.com/dgraph-io/ristretto/v2
-```
-
-This will retrieve the library.
-
-#### Choosing a version
-
-Following these rules:
-
-- v1.x.x is the first version used in most programs with Ristretto dependencies.
-- v2.x.x is the new version with support for generics, for which it has a slightly different
-  interface. This version is designed to solve compatibility problems of programs using the old
-  version of Ristretto. If you start writing a new program, it is recommended to use this version.
-
-## Usage
+## Usage (example)
+The public API mirrors Ristretto; the two differences are: the `Iter` method and the `DisableAutoReallocate`/`AutoReallocateThreshold` config fields. Example usage:
 
 ```go
 package main
@@ -62,127 +38,82 @@ package main
 import (
   "fmt"
 
-  "github.com/dgraph-io/ristretto/v2"
+  "github.com/<your-org>/sigil"
 )
 
 func main() {
-  cache, err := ristretto.NewCache(&ristretto.Config[string, string]{
-    NumCounters: 1e7,     // number of keys to track frequency of (10M).
-    MaxCost:     1 << 30, // maximum cost of cache (1GB).
-    BufferItems: 64,      // number of keys per Get buffer.
+  cache, err := sigil.NewCache(&sigil.Config[string, string]{
+    NumCounters: 1e7,
+    MaxCost:     1 << 30,
+    BufferItems: 64,
+    // Optional: enable automatic reallocation (default: enabled)
+    // AutoReallocateThreshold: 0.9,
+    // DisableAutoReallocate: false,
   })
   if err != nil {
     panic(err)
   }
   defer cache.Close()
 
-  // set a value with a cost of 1
   cache.Set("key", "value", 1)
-
-  // wait for value to pass through buffers
   cache.Wait()
 
-  // get value from cache
   value, found := cache.Get("key")
   if !found {
     panic("missing value")
   }
   fmt.Println(value)
 
-  // del value from cache
-  cache.Del("key")
+  // Iterating over the cache
+  cache.Iter(func(k string, v string) (stop bool) {
+    fmt.Printf("key=%s value=%s\n", k, v)
+    return false // continue
+  })
 }
 ```
 
+---
+
+## Automatic reallocation details
+Sigil introduces an internal monitor that can be enabled by default. Behaviour summary:
+
+- The monitor periodically checks the cache occupancy (`used / MaxCost`).
+- If occupancy >= `AutoReallocateThreshold` (default 0.9), the cache calls `Reallocate()` which doubles the `MaxCost` and copies live items to a new store.
+- Reallocation is guarded by an `atomic` flag; concurrent `Set`/`Get` operations return early when a reallocation is in progress.
+- Automatic reallocation can be disabled by setting `DisableAutoReallocate: true` in the `Config`.
+
+Notes and caveats:
+- Reallocation is an expensive operation — it iterates all keys and reconstructs the policy/store. It is designed to be rare and off the hot path.
+- The reallocation path drains the `setBuf` and temporarily pauses processing; callers should expect short pauses under heavy load while reallocation runs.
+
+---
+
+## Compatibility & Migration
+- Sigil keeps Ristretto's API surface but adds some fields 
+---
+
 ## Benchmarks
+Benchmarks for Sigil should be run the same way as Ristretto; the fork inherits the upstream benchmark suite. If you want to compare behaviour with and without automatic reallocation, enable/disable the `DisableAutoReallocate` flag and run the workload.
+---
 
-The benchmarks can be found in
-https://github.com/hypermodeinc/dgraph-benchmarks/tree/main/cachebench/ristretto.
+## Projects Using Sigil
+This is a new fork; list any consumers here once adopted.
 
-### Hit Ratios for Search
-
-This trace is described as "disk read accesses initiated by a large commercial search engine in
-response to various web search requests."
-
-<p align="center">
-  <img src="https://raw.githubusercontent.com/hypermodeinc/ristretto/main/benchmarks/Hit%20Ratios%20-%20Search%20(ARC-S3).svg"
-  alt="Graph showing hit ratios comparison for search workload">
-</p>
-
-### Hit Ratio for Database
-
-This trace is described as "a database server running at a commercial site running an ERP
-application on top of a commercial database."
-
-<p align="center">
-  <img src="https://raw.githubusercontent.com/hypermodeinc/ristretto/main/benchmarks/Hit%20Ratios%20-%20Database%20(ARC-DS1).svg"
-  alt="Graph showing hit ratios comparison for database workload">
-</p>
-
-### Hit Ratio for Looping
-
-This trace demonstrates a looping access pattern.
-
-<p align="center">
-  <img src="https://raw.githubusercontent.com/hypermodeinc/ristretto/main/benchmarks/Hit%20Ratios%20-%20Glimpse%20(LIRS-GLI).svg"
-  alt="Graph showing hit ratios comparison for looping access pattern">
-</p>
-
-### Hit Ratio for CODASYL
-
-This trace is described as "references to a CODASYL database for a one hour period."
-
-<p align="center">
-  <img src="https://raw.githubusercontent.com/hypermodeinc/ristretto/main/benchmarks/Hit%20Ratios%20-%20CODASYL%20(ARC-OLTP).svg"
-  alt="Graph showing hit ratios comparison for CODASYL workload">
-</p>
-
-### Throughput for Mixed Workload
-
-<p align="center">
-  <img src="https://raw.githubusercontent.com/hypermodeinc/ristretto/main/benchmarks/Throughput%20-%20Mixed.svg"
-  alt="Graph showing throughput comparison for mixed workload">
-</p>
-
-### Throughput for Read Workload
-
-<p align="center">
-  <img src="https://raw.githubusercontent.com/hypermodeinc/ristretto/main/benchmarks/Throughput%20-%20Read%20(Zipfian).svg"
-  alt="Graph showing throughput comparison for read workload">
-</p>
-
-### Through for Write Workload
-
-<p align="center">
-  <img src="https://raw.githubusercontent.com/hypermodeinc/ristretto/main/benchmarks/Throughput%20-%20Write%20(Zipfian).svg"
-  alt="Graph showing throughput comparison for write workload">
-</p>
-
-## Projects Using Ristretto
-
-Below is a list of known projects that use Ristretto:
-
-- [Badger](https://github.com/hypermodeinc/badger) - Embeddable key-value DB in Go
-- [Dgraph](https://github.com/hypermodeinc/dgraph) - Horizontally scalable and distributed GraphQL
-  database with a graph backend
+---
 
 ## FAQ
 
-### How are you achieving this performance? What shortcuts are you taking?
+### Why a fork?
+The goal of Sigil is to provide a minimal, well-scoped set of features on top of Ristretto that are commonly demanded (simple iteration and an optional automatic growth mechanism). Forking lets us iterate on those features while keeping the original project stable.
 
-We go into detail in the
-[Ristretto blog post](https://hypermode.com/blog/introducing-ristretto-high-perf-go-cache/), but in
-short: our throughput performance can be attributed to a mix of batching and eventual consistency.
-Our hit ratio performance is mostly due to an excellent
-[admission policy](https://arxiv.org/abs/1512.00727) and SampledLFU eviction policy.
+### Is Sigil distributed?
+No — same as Ristretto, Sigil is a single-process in-memory cache library.
 
-As for "shortcuts," the only thing Ristretto does that could be construed as one is dropping some
-Set calls. That means a Set call for a new item (updates are guaranteed) isn't guaranteed to make it
-into the cache. The new item could be dropped at two points: when passing through the Set buffer or
-when passing through the admission policy. However, this doesn't affect hit ratios much at all as we
-expect the most popular items to be Set multiple times and eventually make it in the cache.
+---
 
-### Is Ristretto distributed?
+## License
 
-No, it's just like any other Go library that you can import into your project and use in a single
-process.
+This fork inherits the original project's license (Apache-2.0). Keep the same licensing terms when reusing code from upstream.
+---
+
+

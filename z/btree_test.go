@@ -18,7 +18,7 @@ import (
 	"github.com/dustin/go-humanize"
 	"github.com/stretchr/testify/require"
 
-	"github.com/NikoMalik/ristretto/v2/z/simd"
+	"github.com/NikoMalik/sigil/z/simd"
 )
 
 var tmp int

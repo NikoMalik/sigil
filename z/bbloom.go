@@ -29,7 +29,7 @@ import (
 )
 
 // helper
-var mask = []uint8{1, 2, 4, 8, 16, 32, 64, 128}
+var mask = [8]uint8{1, 2, 4, 8, 16, 32, 64, 128}
 
 func getSize(ui64 uint64) (size uint64, exponent uint64) {
 	if ui64 < uint64(512) {
