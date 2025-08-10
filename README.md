@@ -47,7 +47,6 @@ func main() {
     MaxCost:     1 << 30,
     BufferItems: 64,
     // Optional: enable automatic reallocation (default: enabled)
-    // AutoReallocateThreshold: 0.9,
     // DisableAutoReallocate: false,
   })
   if err != nil {
