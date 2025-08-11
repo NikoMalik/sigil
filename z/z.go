@@ -47,7 +47,7 @@ func keyToHash[K Key](key K) (uint64, uint64) {
 
 const DefaultSeed = 0xa0761d6478bd642f
 
-func KeyToHash[K Key](key K) (uint64, uint64) {
+func keyToHashWyHash[K Key](key K) (uint64, uint64) {
 	switch k := any(key).(type) {
 	case uint64:
 		return k, 0
@@ -82,7 +82,7 @@ func KeyToHash[K Key](key K) (uint64, uint64) {
 }
 
 // wyhash faster version
-func keyToHashWyHash[K Key](key K) (uint64, uint64) {
+func KeyToHash[K Key](key K) (uint64, uint64) {
 	keyAsAny := any(key)
 	switch k := keyAsAny.(type) {
 	case uint64:

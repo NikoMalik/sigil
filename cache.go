@@ -6,7 +6,7 @@
 // Ristretto is a fast, fixed size, in-memory cache with a dual focus on
 // throughput and hit ratio performance. You can easily add Ristretto to an
 // existing system and keep the most valuable data where you need it.
-package ristretto
+package sigil
 
 import (
 	"bytes"
@@ -813,9 +813,7 @@ func (c *Cache[K, V]) GetTTL(key K) (time.Duration, bool) {
 	return time.Until(expiration), true
 }
 
-// Clear empties the hashmap and zeroes all cachePolicy counters. Note that this is
-// not an atomic operation (but that shouldn't be a problem as it's assumed that
-// Set/Get calls won't be occurring until after this).
+// Clear empties the hashmap and zeroes all cachePolicy counters. Note that this is an atomic operation
 func (c *Cache[K, V]) Clear() {
 	if c == nil || c.isClosed.Load() || c.reallocating.Load() {
 		return
