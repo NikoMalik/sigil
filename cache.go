@@ -567,7 +567,7 @@ func (c *Cache[K, V]) Reallocate() error {
 
 	// Create new policy with doubled MaxCost
 	newMax := oldPolicy.MaxCost() * 2
-	newPolicy := newPolicy[K, V](oldPolicy.admit.resetAt, newMax)
+	newPolicy := newPolicy[K, V](newMax*10, newMax)
 	if c.Metrics != nil {
 		newPolicy.CollectMetrics(c.Metrics)
 	}
