@@ -16,7 +16,8 @@ import (
 const (
 	// lfuSample is the number of items to sample when looking at eviction
 	// candidates. 5 seems to be the most optimal number [citation needed].
-	lfuSample = 5
+	lfuSample        = 5
+	minHitsThreshold = 3 // to save from eviction
 )
 
 func newPolicy[K Key, V any](numCounters, maxCost int64) *defaultPolicy[K, V] {
@@ -135,6 +136,11 @@ func (p *defaultPolicy[K, V]) Add(key uint64, originalKey K, cost int64) ([]*Ite
 				minKey, minHits, minId, minCost = pair.key, hits, i, pair.cost
 				minOriginalKey = pair.originalKey
 			}
+		}
+
+		if minHits >= minHitsThreshold {
+			p.metrics.add(rejectSets, key, 1)
+			return victims, false
 		}
 
 		if incHits < minHits {
